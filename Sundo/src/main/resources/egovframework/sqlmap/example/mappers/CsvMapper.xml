@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="egovframework.example.sample.service.impl.CsvMapper">
+
+
+	<insert id="insertCsv">
+		
+		INSERT INTO points (gid, lon, lat, date, time, geom, car_num, noise, rpm)
+		VALUES (
+		    NEXTVAL('gid_seq'),          
+		    #{longitude},          
+		    #{latitude},          
+		    #{date},
+		    #{time}::time,
+		    ST_SetSRID(ST_MakePoint(CAST(#{longitude} AS DOUBLE PRECISION), CAST(#{latitude} AS DOUBLE PRECISION)), 4326), 
+		    #{car_num},     
+		    #{noise},        
+		    #{rpm}      
+		)
+
+	</insert>
+	
+	<insert id="insertLine">
+	
+		WITH ordered_points AS (
+		    SELECT date, 
+		           time, 
+		           ST_SetSRID(ST_MakePoint(CAST(lon AS DOUBLE PRECISION), CAST(lat AS DOUBLE PRECISION)), 4326) AS geom
+		    FROM points
+		    WHERE date = #{date}
+		    ORDER BY time ASC
+		), 
+		line AS (
+		    SELECT date,
+		           ST_MakeLine(geom ORDER BY time ASC) AS line_geom,
+		           MIN(time) AS "begin",
+		           MAX(time) AS "end"
+		    FROM ordered_points
+		    GROUP BY date
+		),
+		longest_line AS (
+		    SELECT date, line_geom, "begin", "end",
+		           ROW_NUMBER() OVER(PARTITION BY date ORDER BY ST_Length(line_geom) DESC) as rn
+		    FROM line
+		)
+		INSERT INTO "경로" (id, geom, fid, date, "begin", "end")
+		SELECT NEXTVAL('seq_경로'), line_geom, CURRVAL('seq_경로'), date, "begin", "end"
+		FROM longest_line
+		WHERE rn = 1
+
+	</insert>
+	
+	<delete id="deleteLine">
+				WITH ranked_lines AS (
+		    SELECT id, 
+		           date, 
+		           geom, 
+		           ROW_NUMBER() OVER (PARTITION BY date ORDER BY ST_Length(geom) DESC) AS rn
+		    FROM "경로"
+		)
+		DELETE FROM "경로"
+		WHERE id IN (
+		    SELECT id 
+		    FROM ranked_lines
+		    WHERE rn > 1
+		)
+		
+		
+	</delete>
+</mapper>
