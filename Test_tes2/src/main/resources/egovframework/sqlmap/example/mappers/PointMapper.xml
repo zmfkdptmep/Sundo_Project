@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+  PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+  "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!-- mapper의 namespace속성은 연결할 mapper의 interface 풀 경로로 작성  -->
+<mapper namespace="egovframework.ddan.mapper.PointMapper">
+
+	<select id="goLive" resultType="egovframework.ddan.vo.PointsVo">
+		select * from points
+	</select>
+
+	
+
+	<insert id="insertList" >
+	    INSERT INTO points (gid, lat, lon, geom, noise, rpm, time, date, car_num) 
+			VALUES (
+			    nextval('gid_sequence'), 
+			    #{latitude}, 
+			    #{longitude}, 
+			    ST_SetSRID(ST_MakePoint(CAST(#{longitude} AS DOUBLE PRECISION), CAST(#{latitude} AS DOUBLE PRECISION)), 4326), 
+			    #{noise}, 
+			    #{rpm}, 
+			    #{time}, 
+			    #{date}, 
+			    #{car_num}
+			)
+	</insert>
+	
+	<!-- <select id="getCarList" resultType="egovframework.ddan.vo.PointsVo">
+		SELECT DISTINCT car_num
+		FROM points
+	</select> -->
+	
+	<select id="getCarList" resultType="egovframework.ddan.vo.PointsVo">
+		SELECT car_num
+		FROM car
+	</select>
+	
+	<select id="getCleanData" resultType="egovframework.ddan.vo.CleanVo">
+		SELECT
+		    (SELECT TO_CHAR(MAX("time")::time - MIN("time"), 'HH24:MI:SS') AS timediff
+		    FROM points
+		    WHERE car_num = #{car_num} AND date = #{date}) AS "time",
+		    
+		    (SELECT
+		        CASE
+		            WHEN (SELECT COUNT(*) FROM points WHERE car_num = #{car_num} AND date = #{date}) = 0
+		            THEN null
+		            ELSE TRUNC((COUNT(*)::float / (SELECT COUNT(*) FROM points WHERE car_num = #{car_num} AND date = #{date})*100)::numeric,2)
+		        END
+		    FROM points
+		    WHERE car_num = #{car_num} AND date = #{date} AND noise >= 80 AND rpm > 1500
+		    ) AS ratio,
+		
+		    lon, 
+		    lat 
+		
+		FROM points
+		WHERE car_num = #{car_num} AND date = #{date}
+		LIMIT 1
+	</select>
+	
+	   <insert id="insertCsv">
+      
+      INSERT INTO points (gid, lon, lat, date, time, geom, car_num, noise, rpm)
+      VALUES (
+          NEXTVAL('gid_sequence'),          
+          #{lon},          
+          #{lat},          
+          #{date},
+          #{time}::time,
+          ST_SetSRID(ST_MakePoint(CAST(#{lon} AS DOUBLE PRECISION), CAST(#{lat} AS DOUBLE PRECISION)), 4326), 
+          #{car_num},     
+          #{noise},        
+          #{rpm}      
+      )
+
+   </insert>
+   
+    <select id="getStaics" resultType="egovframework.ddan.vo.CleanVo">
+		<![CDATA[ 
+			WITH DateCleaningData AS (
+			    SELECT DISTINCT date
+			    FROM points
+			    WHERE car_num = #{car_num} AND TO_CHAR(TO_DATE(date, 'YYYY-MM'), 'YYYY-MM') = #{date}
+			)
+			SELECT
+			    dcd.date,
+			    TO_CHAR(MAX(p."time")::time - MIN(p."time"), 'HH24:MI:SS') AS time,
+			    CASE
+			        WHEN COUNT(*) = 0 THEN NULL
+			        ELSE TRUNC((COUNT(*) FILTER (WHERE p.noise >= 80 AND p.rpm > 1500)::numeric / COUNT(*)) * 100::numeric(5, 2),2)
+			    END AS ratio
+			FROM DateCleaningData dcd
+			LEFT JOIN points p ON dcd.date = p.date
+			WHERE p.car_num = #{car_num}
+			GROUP BY dcd.date
+			ORDER BY dcd.date
+		]]>
+	
+	</select> 
+   
+	
+	 <!-- <select id="getStaics" resultType="egovframework.ddan.vo.CleanVo">
+		<![CDATA[ 
+			WITH DateCleaningData AS (
+			    SELECT DISTINCT date
+			    FROM points
+			    WHERE car_num = '103하2414' AND date >= '2023-08-01' AND date <= '2023-08-31'
+			)
+			SELECT
+			    dcd.date,
+			    TO_CHAR(MAX(p."time")::time - MIN(p."time"), 'HH24:MI:SS') AS time,
+			    CASE
+			        WHEN COUNT(*) = 0 THEN NULL
+			        ELSE TRUNC((COUNT(*) FILTER (WHERE p.noise >= 80 AND p.rpm > 1500)::numeric / COUNT(*)) * 100::numeric(5, 2),2)
+			    END AS ratio
+			FROM DateCleaningData dcd
+			LEFT JOIN points p ON dcd.date = p.date
+			WHERE p.car_num = '103하2414'
+			GROUP BY dcd.date
+			ORDER BY dcd.date
+		]]>
+	
+	</select>  -->
+	
+	<select id="monthData" resultType="egovframework.ddan.vo.CleanVo">
+		<![CDATA[	 
+			WITH TimeDiffs AS (
+			    SELECT 
+			        points.date,
+			        MAX(points."time")::time - MIN(points."time") AS diff
+			    FROM points
+			    WHERE car_num = '114하6585' 
+			        AND EXTRACT(MONTH FROM points.date::date) = 9 
+			        AND EXTRACT(YEAR FROM points.date::date) = 2023
+			    GROUP BY points.date
+			)
+			
+			, RatioPerDay AS (
+			    SELECT
+			        points.date,
+			        CASE
+			            WHEN COUNT(*) = 0 THEN null
+			            ELSE TRUNC((COUNT(CASE WHEN noise >= 80 AND rpm > 1500 THEN 1 END)::float / COUNT(*)*100)::numeric,2)
+			        END AS ratio
+			    FROM points
+			    WHERE car_num = '114하6585' 
+			        AND EXTRACT(MONTH FROM points.date::date) = 9 
+			        AND EXTRACT(YEAR FROM points.date::date) = 2023
+			    GROUP BY points.date
+			)
+			
+			SELECT
+			    -- 청소 시간 합계 계산
+			    TO_CHAR(SUM(TimeDiffs.diff), 'HH24:MI:SS') AS "time",
+			
+			    -- 평균 비율 계산
+			    TRUNC(AVG(RatioPerDay.ratio),2) AS ratio
+			
+			FROM TimeDiffs
+			JOIN RatioPerDay ON TimeDiffs.date = RatioPerDay.date
+		]]>
+	</select>
+	
+	  <select id="getDateList" resultType="egovframework.ddan.vo.PointsVo">
+	  	select distinct(date) from points where car_num = #{car_num}
+	  </select>
+	  
+	  <select id="getCleanTimeRatio" resultType="egovframework.ddan.vo.CleanVo">
+	  	select 
+		    (select max(time)-min(time) from points where date = #{date} and car_num = #{car_num}) as time,	
+		round
+			((select count(*) from points where date = #{date} and car_num = #{car_num} and (noise>=80 and rpm>=1500)) 
+			* 100.0
+			/ (select count(*) from points where date = #{date} and car_num = #{car_num}), 2) as ratio;
+	  </select>
+	  
+	  <select id="getCenter" resultType="egovframework.ddan.vo.PointsVo">
+	  	select * from points where date = #{date} and car_num = #{car_num} order by time desc limit 1
+	  </select>
+	  
+	  <!-- 로그인 회원조회 -->
+	  <select id="login" resultType="egovframework.ddan.service.MemberVo">
+	  	select * from admin
+	  	where id = #{id} and pw = #{pw}
+	  </select>
+	  
+	  <insert id="addCar">
+	  	insert into car (car_num, car_type) values (#{car_num}, #{car_type})
+	  </insert>
+
+</mapper>

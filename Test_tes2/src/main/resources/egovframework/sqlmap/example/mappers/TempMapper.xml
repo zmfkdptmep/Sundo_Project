@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="egovframework.ddan.mapper.TempMapper">
+
+
+	<insert id="insert">
+	    insert into temp (latitude, longitude, date, time, noise, rpm, car_num, geom)
+	    	values (#{latitude}, #{longitude}, 
+	    	CURRENT_DATE, TO_CHAR(CURRENT_TIME::time, 'HH24:MI:SS'), 
+	    	#{noise}, #{rpm}, #{car_num},
+	    	ST_SetSRID(ST_MakePoint(CAST(#{longitude} AS DOUBLE PRECISION), CAST(#{latitude} AS DOUBLE PRECISION)), 4326))
+	</insert>
+	
+	<select id="getLocaList" resultType="egovframework.ddan.vo.LocationVo">
+		
+		select * from temp
+		
+	</select>
+	
+	<delete id="deleteTemt">
+		
+		delete from temp			
+			
+	</delete>
+
+</mapper>
