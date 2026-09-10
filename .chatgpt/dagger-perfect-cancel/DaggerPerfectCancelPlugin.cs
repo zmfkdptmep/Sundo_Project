@@ -8,6 +8,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
+using UnityEngine;
 
 namespace Goni.DaggerPerfectCancel
 {
@@ -16,9 +17,9 @@ namespace Goni.DaggerPerfectCancel
     {
         public const string PluginGuid = "goni.valheim.daggerperfectcancel";
         public const string PluginName = "Goni Dagger Perfect Cancel";
-        public const string PluginVersion = "1.0.0";
+        public const string PluginVersion = "1.1.0";
 
-        // Win32: XBUTTON2 = the second side mouse button, normally called Mouse5.
+        private const int VkXButton1 = 0x05;
         private const int VkXButton2 = 0x06;
         private const int KeyDownMask = 0x8000;
 
@@ -35,6 +36,7 @@ namespace Goni.DaggerPerfectCancel
         private FieldInfo _animatorField;
         private FieldInfo _blockingAnimatorHashField;
         private MethodInfo _animatorGetBool;
+        private FieldInfo _queuedAttackTimerField;
 
         private int _attackIndex = -1;
         private int _attackHoldIndex = -1;
@@ -45,7 +47,9 @@ namespace Goni.DaggerPerfectCancel
         private ConfigEntry<bool> _requireKnife;
         private ConfigEntry<bool> _confirmAnimatorBlock;
         private ConfigEntry<bool> _verbose;
+        private ConfigEntry<bool> _acceptEitherSideButton;
         private ConfigEntry<int> _triggerVirtualKey;
+        private ConfigEntry<float> _queuedAttackSeconds;
         private ConfigEntry<int> _firstAttackStartTimeoutMs;
         private ConfigEntry<int> _firstAttackEndTimeoutMs;
         private ConfigEntry<int> _blockStartTimeoutMs;
@@ -57,6 +61,10 @@ namespace Goni.DaggerPerfectCancel
         private bool _blockPressSent;
         private bool _warnedWeaponReflection;
         private bool _warnedAnimatorReflection;
+        private bool _warnedQueueReflection;
+        private bool _unityMouse5Down;
+        private bool _unityMouse4Down;
+        private string _lastTriggerSource = string.Empty;
 
         private enum SequenceState
         {
@@ -80,49 +88,61 @@ namespace Goni.DaggerPerfectCancel
             _enabled = Config.Bind("General", "Enabled", true,
                 "Enable Mouse5 automatic dagger block-cancel.");
             _requireKnife = Config.Bind("General", "RequireKnife", true,
-                "Only activate when the currently equipped weapon uses the Knives skill. If weapon reflection fails after a game update, the mod falls back to allowing the sequence instead of hard-failing.");
+                "Only activate when the equipped weapon uses the Knives skill.");
             _confirmAnimatorBlock = Config.Bind("General", "ConfirmAnimatorBlock", true,
-                "When possible, wait until the actual Animator blocking parameter has switched on before releasing block. Falls back to IsBlocking() if the animator field changes.");
+                "Wait for the actual Animator blocking flag before releasing block when available.");
             _verbose = Config.Bind("General", "VerboseLogging", false,
-                "Log each state transition to BepInEx/LogOutput.log.");
+                "Log every state transition.");
+            _acceptEitherSideButton = Config.Bind("Input", "AcceptEitherSideButtonFallback", true,
+                "Also accept the other side mouse button as a fallback. Useful because mouse software can swap XBUTTON1/XBUTTON2 naming.");
             _triggerVirtualKey = Config.Bind("Input", "TriggerVirtualKey", VkXButton2,
-                "Win32 virtual-key code. 0x06 / decimal 6 is XBUTTON2 (normally Mouse5).");
+                "Primary Win32 virtual-key. Decimal 6 is XBUTTON2, normally Mouse5.");
+            _queuedAttackSeconds = Config.Bind("Timing", "QueuedAttackSeconds", 0.25f,
+                "How long to keep the post-block primary attack queued internally. This is not an animation delay; it ensures Valheim consumes the attack on the first legal tick.");
 
-            // These are only fail-safe timeouts. Successful timing is state-driven, not millisecond-driven.
             _firstAttackStartTimeoutMs = Config.Bind("Failsafe", "FirstAttackStartTimeoutMs", 700,
-                "Abort if the first attack cannot start in this many milliseconds.");
-            _firstAttackEndTimeoutMs = Config.Bind("Failsafe", "FirstAttackEndTimeoutMs", 1600,
-                "Abort if the first attack never reaches its end state.");
-            _blockStartTimeoutMs = Config.Bind("Failsafe", "BlockStartTimeoutMs", 500,
-                "Abort if blocking cannot become active after the first attack.");
-            _secondAttackStartTimeoutMs = Config.Bind("Failsafe", "SecondAttackStartTimeoutMs", 300,
-                "Abort if the post-block attack cannot start in this many milliseconds.");
+                "Abort if first attack cannot start.");
+            _firstAttackEndTimeoutMs = Config.Bind("Failsafe", "FirstAttackEndTimeoutMs", 1800,
+                "Abort if first attack never ends.");
+            _blockStartTimeoutMs = Config.Bind("Failsafe", "BlockStartTimeoutMs", 700,
+                "Abort if block never becomes active.");
+            _secondAttackStartTimeoutMs = Config.Bind("Failsafe", "SecondAttackStartTimeoutMs", 600,
+                "Abort if the post-block attack cannot start.");
 
             if (!InitializeReflection())
             {
-                Logger.LogError("Could not initialize against Player.SetControls; mod is disabled.");
+                Logger.LogError("Could not initialize against Player.SetControls; mod disabled.");
                 _enabled.Value = false;
                 return;
             }
 
             _harmony = new Harmony(PluginGuid);
-            var prefix = new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), nameof(SetControlsPrefix));
-            _harmony.Patch(_setControls, prefix: prefix);
+            _harmony.Patch(_setControls,
+                prefix: new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), nameof(SetControlsPrefix)));
 
-            Logger.LogInfo($"{PluginName} {PluginVersion} loaded. Mouse5/XBUTTON2 state-driven block cancel ready.");
+            Logger.LogInfo($"{PluginName} {PluginVersion} loaded. Mouse5 multi-source input + state-driven block cancel ready.");
+        }
+
+        private void Update()
+        {
+            // Unity names mouse buttons zero-based: Mouse4 is the fifth mouse button (Mouse5 in
+            // common mouse-software/UI naming), Mouse3 is the fourth. Cache them on the Unity
+            // Update thread and consume in the SetControls patch.
+            try
+            {
+                _unityMouse5Down = Input.GetKey(KeyCode.Mouse4);
+                _unityMouse4Down = Input.GetKey(KeyCode.Mouse3);
+            }
+            catch
+            {
+                _unityMouse5Down = false;
+                _unityMouse4Down = false;
+            }
         }
 
         private void OnDestroy()
         {
-            try
-            {
-                _harmony?.UnpatchSelf();
-            }
-            catch
-            {
-                // Ignore shutdown-time patch errors.
-            }
-
+            try { _harmony?.UnpatchSelf(); } catch { }
             ResetSequence("plugin unload");
             _instance = null;
             _log = null;
@@ -132,64 +152,46 @@ namespace Goni.DaggerPerfectCancel
         {
             _playerType = AccessTools.TypeByName("Player");
             if (_playerType == null)
-            {
-                Logger.LogError("Player type was not found.");
                 return false;
-            }
 
             _setControls = _playerType
                 .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
                 .Where(m => m.Name == "SetControls")
                 .OrderByDescending(m => m.GetParameters().Length)
                 .FirstOrDefault(m => HasControlParameters(m.GetParameters()));
-
             if (_setControls == null)
-            {
-                Logger.LogError("Player.SetControls with attack/block arguments was not found.");
                 return false;
-            }
 
             var parameters = _setControls.GetParameters();
             _attackIndex = FindParameter(parameters, "attack", 1);
             _attackHoldIndex = FindParameter(parameters, "attackHold", 2);
             _blockIndex = FindParameter(parameters, "block", 5);
             _blockHoldIndex = FindParameter(parameters, "blockHold", 6);
-
-            if (!ValidIndex(_attackIndex, parameters.Length)
-                || !ValidIndex(_attackHoldIndex, parameters.Length)
-                || !ValidIndex(_blockIndex, parameters.Length)
-                || !ValidIndex(_blockHoldIndex, parameters.Length))
-            {
-                Logger.LogError("Player.SetControls argument layout is incompatible with this build.");
+            if (!ValidIndex(_attackIndex, parameters.Length) ||
+                !ValidIndex(_attackHoldIndex, parameters.Length) ||
+                !ValidIndex(_blockIndex, parameters.Length) ||
+                !ValidIndex(_blockHoldIndex, parameters.Length))
                 return false;
-            }
 
             _inAttack = AccessTools.Method(_playerType, "InAttack", Type.EmptyTypes);
             _isBlocking = AccessTools.Method(_playerType, "IsBlocking", Type.EmptyTypes);
             _getCurrentWeapon = AccessTools.Method(_playerType, "GetCurrentWeapon", Type.EmptyTypes);
             _localPlayerField = AccessTools.Field(_playerType, "m_localPlayer");
-
+            _queuedAttackTimerField = FindFieldInHierarchy(_playerType, "m_queuedAttackTimer");
             if (_inAttack == null || _isBlocking == null)
-            {
-                Logger.LogError("Required Player state methods InAttack()/IsBlocking() were not found.");
                 return false;
-            }
 
-            // Optional animation confirmation. Everything here is allowed to fail and fall back.
             _animatorField = FindFieldInHierarchy(_playerType, "m_animator");
             var humanoidType = AccessTools.TypeByName("Humanoid");
             if (humanoidType != null)
                 _blockingAnimatorHashField = AccessTools.Field(humanoidType, "s_blocking");
-
             if (_animatorField != null)
-            {
-                var animatorType = _animatorField.FieldType;
-                _animatorGetBool = animatorType.GetMethod("GetBool", new[] { typeof(int) });
-            }
+                _animatorGetBool = _animatorField.FieldType.GetMethod("GetBool", new[] { typeof(int) });
 
             Logger.LogInfo(
                 $"Patched {_playerType.FullName}.{_setControls.Name}({parameters.Length} args); " +
-                $"attack={_attackIndex}, attackHold={_attackHoldIndex}, block={_blockIndex}, blockHold={_blockHoldIndex}.");
+                $"attack={_attackIndex}, attackHold={_attackHoldIndex}, block={_blockIndex}, blockHold={_blockHoldIndex}, " +
+                $"queuedAttackTimer={(_queuedAttackTimerField != null ? "found" : "missing")}.");
             return true;
         }
 
@@ -198,22 +200,16 @@ namespace Goni.DaggerPerfectCancel
             var names = new HashSet<string>(parameters.Select(p => p.Name ?? string.Empty), StringComparer.OrdinalIgnoreCase);
             if (names.Contains("attack") && names.Contains("attackHold") && names.Contains("block") && names.Contains("blockHold"))
                 return true;
-
-            // Known Valheim SetControls layout fallback if metadata parameter names are stripped.
-            return parameters.Length >= 7
-                && parameters[1].ParameterType == typeof(bool)
-                && parameters[2].ParameterType == typeof(bool)
-                && parameters[5].ParameterType == typeof(bool)
-                && parameters[6].ParameterType == typeof(bool);
+            return parameters.Length >= 7 && parameters[1].ParameterType == typeof(bool) &&
+                parameters[2].ParameterType == typeof(bool) && parameters[5].ParameterType == typeof(bool) &&
+                parameters[6].ParameterType == typeof(bool);
         }
 
         private static int FindParameter(ParameterInfo[] parameters, string name, int fallback)
         {
             for (var i = 0; i < parameters.Length; i++)
-            {
                 if (string.Equals(parameters[i].Name, name, StringComparison.OrdinalIgnoreCase))
                     return i;
-            }
             return fallback;
         }
 
@@ -223,8 +219,8 @@ namespace Goni.DaggerPerfectCancel
         {
             for (var t = type; t != null; t = t.BaseType)
             {
-                var field = t.GetField(name,
-                    BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                var field = t.GetField(name, BindingFlags.Instance | BindingFlags.Static |
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
                 if (field != null)
                     return field;
             }
@@ -238,15 +234,18 @@ namespace Goni.DaggerPerfectCancel
 
         private void ProcessControls(object player, object[] args)
         {
-            if (!_enabled.Value || player == null || args == null)
+            if (!_enabled.Value || player == null || args == null || !IsLocalPlayer(player))
                 return;
 
-            if (!IsLocalPlayer(player))
-                return;
-
-            var mouseDown = IsTriggerDown();
+            var mouseDown = IsTriggerDown(out var triggerSource);
             var pressedThisFrame = mouseDown && !_mouseWasDown;
             _mouseWasDown = mouseDown;
+
+            if (pressedThisFrame)
+            {
+                _lastTriggerSource = triggerSource;
+                Logger.LogInfo("[DPC] Mouse5 trigger detected via " + triggerSource + ".");
+            }
 
             if (_state == SequenceState.Idle)
             {
@@ -255,30 +254,25 @@ namespace Goni.DaggerPerfectCancel
 
                 if (_requireKnife.Value && !IsKnifeEquipped(player))
                 {
-                    DebugLog("Mouse5 ignored: current weapon is not a knife.");
+                    Logger.LogWarning("[DPC] Trigger detected, but equipped weapon is not a knife. Sequence ignored.");
                     return;
                 }
 
-                // You can press Mouse5 from idle (the mod starts hit #1), or during a manually-started
-                // first swing (the mod arms itself and takes over at the recovery boundary).
                 if (InvokeBool(_inAttack, player))
-                    SetState(SequenceState.WaitFirstAttackEnd, "armed during an existing first attack");
+                    SetState(SequenceState.WaitFirstAttackEnd, "armed during existing attack");
                 else
-                    SetState(SequenceState.RequestFirstAttack, "Mouse5 pressed from idle");
+                    SetState(SequenceState.RequestFirstAttack, "trigger from idle");
             }
 
             if (_state == SequenceState.Idle)
                 return;
 
-            // Hold-mode safety: releasing Mouse5 at any time stops forcing inputs immediately.
             if (!mouseDown)
             {
                 ResetSequence("Mouse5 released");
                 return;
             }
 
-            // During the sequence, neutralize only primary attack and block; movement, camera,
-            // jump, dodge, secondary attack, etc. remain vanilla.
             SetAttack(args, false, false);
             SetBlock(args, false, false);
 
@@ -288,17 +282,15 @@ namespace Goni.DaggerPerfectCancel
                     if (InvokeBool(_inAttack, player))
                     {
                         SetState(SequenceState.WaitFirstAttackEnd, "first attack accepted");
-                        return;
+                        break;
                     }
-
                     if (StateElapsedMs() > _firstAttackStartTimeoutMs.Value)
                     {
                         ResetSequence("first attack start timeout");
-                        return;
+                        break;
                     }
-
-                    // Request a clean first click every control tick until Valheim accepts it.
-                    SetAttack(args, true, false);
+                    // A physical click is both edge + held on its first frame.
+                    SetAttack(args, true, true);
                     break;
 
                 case SequenceState.WaitFirstAttackEnd:
@@ -306,10 +298,8 @@ namespace Goni.DaggerPerfectCancel
                     {
                         if (StateElapsedMs() > _firstAttackEndTimeoutMs.Value)
                             ResetSequence("first attack end timeout");
-                        return;
+                        break;
                     }
-
-                    // InAttack() has actually dropped: this is the recovery boundary we care about.
                     _blockPressSent = false;
                     SetState(SequenceState.RaiseBlock, "first attack ended; raising block");
                     SetBlock(args, true, true);
@@ -320,23 +310,18 @@ namespace Goni.DaggerPerfectCancel
                 {
                     var gameBlocking = InvokeBool(_isBlocking, player);
                     var animatorReady = IsAnimatorBlockingOrUnavailable(player);
-
                     if (gameBlocking && animatorReady)
                     {
-                        // We observed the real block state (and, when available, the Animator's
-                        // blocking parameter). Release it on this exact control tick.
-                        SetState(SequenceState.ReleaseBlock, "block animation/state observed; releasing block");
+                        SetState(SequenceState.ReleaseBlock, "real block state/animation observed");
                         SetBlock(args, false, false);
+                        QueuePrimaryAttack(player);
                         break;
                     }
-
                     if (StateElapsedMs() > _blockStartTimeoutMs.Value)
                     {
                         ResetSequence("block start timeout");
-                        return;
+                        break;
                     }
-
-                    // Initial tick sends both edge+hold; later ticks only hold.
                     SetBlock(args, !_blockPressSent, true);
                     _blockPressSent = true;
                     break;
@@ -344,9 +329,7 @@ namespace Goni.DaggerPerfectCancel
 
                 case SequenceState.ReleaseBlock:
                     SetBlock(args, false, false);
-
-                    // Do not guess a delay. Wait until Valheim itself reports block is actually off,
-                    // then request the follow-up attack on the first legal control tick.
+                    QueuePrimaryAttack(player);
                     if (!InvokeBool(_isBlocking, player))
                     {
                         SetState(SequenceState.RequestSecondAttack, "blocking fully released");
@@ -356,27 +339,22 @@ namespace Goni.DaggerPerfectCancel
 
                 case SequenceState.RequestSecondAttack:
                     SetBlock(args, false, false);
-
+                    QueuePrimaryAttack(player);
                     if (InvokeBool(_inAttack, player))
                     {
-                        SetState(SequenceState.HoldPrimary, "post-block attack accepted; holding primary");
+                        SetState(SequenceState.HoldPrimary, "post-block attack accepted");
                         SetAttack(args, false, true);
                         break;
                     }
-
                     if (StateElapsedMs() > _secondAttackStartTimeoutMs.Value)
                     {
                         ResetSequence("second attack start timeout");
-                        return;
+                        break;
                     }
-
-                    // Re-request every frame until the exact first frame the engine permits it.
-                    // This removes the human/FPS-dependent timing guess.
                     SetAttack(args, true, true);
                     break;
 
                 case SequenceState.HoldPrimary:
-                    // Equivalent to keeping LMB held after the successful block cancel.
                     SetBlock(args, false, false);
                     SetAttack(args, false, true);
                     break;
@@ -387,60 +365,108 @@ namespace Goni.DaggerPerfectCancel
         {
             if (_localPlayerField == null)
                 return true;
-
             try
             {
                 var local = _localPlayerField.GetValue(null);
                 return local == null || ReferenceEquals(local, player);
             }
-            catch
-            {
-                return true;
-            }
+            catch { return true; }
         }
 
-        private bool IsTriggerDown()
+        private bool IsTriggerDown(out string source)
         {
+            source = string.Empty;
+
+            // Preferred: Unity input for the fifth mouse button.
+            if (_unityMouse5Down)
+            {
+                source = "Unity KeyCode.Mouse4 (5th mouse button)";
+                return true;
+            }
+
             try
             {
-                return (GetAsyncKeyState(_triggerVirtualKey.Value) & KeyDownMask) != 0;
+                if ((GetAsyncKeyState(_triggerVirtualKey.Value) & KeyDownMask) != 0)
+                {
+                    source = "Win32 VK 0x" + _triggerVirtualKey.Value.ToString("X2");
+                    return true;
+                }
             }
-            catch
+            catch { }
+
+            if (_acceptEitherSideButton.Value)
             {
-                return false;
+                if (_unityMouse4Down)
+                {
+                    source = "Unity KeyCode.Mouse3 fallback";
+                    return true;
+                }
+
+                try
+                {
+                    var alternate = _triggerVirtualKey.Value == VkXButton1 ? VkXButton2 : VkXButton1;
+                    if ((GetAsyncKeyState(alternate) & KeyDownMask) != 0)
+                    {
+                        source = "Win32 alternate VK 0x" + alternate.ToString("X2");
+                        return true;
+                    }
+                }
+                catch { }
+            }
+
+            return false;
+        }
+
+        private void QueuePrimaryAttack(object player)
+        {
+            if (_queuedAttackTimerField == null)
+            {
+                if (!_warnedQueueReflection)
+                {
+                    _warnedQueueReflection = true;
+                    Logger.LogWarning("[DPC] m_queuedAttackTimer not found; relying on held attack input only.");
+                }
+                return;
+            }
+
+            try
+            {
+                var current = (float)_queuedAttackTimerField.GetValue(player);
+                var target = Mathf.Max(current, _queuedAttackSeconds.Value);
+                _queuedAttackTimerField.SetValue(player, target);
+            }
+            catch (Exception ex)
+            {
+                if (!_warnedQueueReflection)
+                {
+                    _warnedQueueReflection = true;
+                    Logger.LogWarning("[DPC] Could not set m_queuedAttackTimer: " + ex.Message);
+                }
             }
         }
 
         private bool IsKnifeEquipped(object player)
         {
             if (_getCurrentWeapon == null)
-                return true; // compatibility fallback
-
+                return true;
             try
             {
                 var weapon = _getCurrentWeapon.Invoke(player, null);
                 if (weapon == null)
                     return false;
-
                 var sharedField = FindFieldInHierarchy(weapon.GetType(), "m_shared");
                 if (sharedField == null)
-                    return WeaponReflectionFallback("m_shared field not found");
-
+                    return WeaponReflectionFallback("m_shared missing");
                 var shared = sharedField.GetValue(weapon);
                 if (shared == null)
-                    return WeaponReflectionFallback("m_shared was null");
-
+                    return WeaponReflectionFallback("m_shared null");
                 var skillField = FindFieldInHierarchy(shared.GetType(), "m_skillType");
                 if (skillField == null)
-                    return WeaponReflectionFallback("m_skillType field not found");
-
+                    return WeaponReflectionFallback("m_skillType missing");
                 var skill = skillField.GetValue(shared);
-                if (skill == null)
-                    return WeaponReflectionFallback("m_skillType was null");
-
-                var skillName = skill.ToString() ?? string.Empty;
-                return skillName.IndexOf("Kniv", StringComparison.OrdinalIgnoreCase) >= 0
-                    || skillName.IndexOf("Dagger", StringComparison.OrdinalIgnoreCase) >= 0;
+                var skillName = skill?.ToString() ?? string.Empty;
+                return skillName.IndexOf("Kniv", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                       skillName.IndexOf("Dagger", StringComparison.OrdinalIgnoreCase) >= 0;
             }
             catch (Exception ex)
             {
@@ -453,7 +479,7 @@ namespace Goni.DaggerPerfectCancel
             if (!_warnedWeaponReflection)
             {
                 _warnedWeaponReflection = true;
-                Logger.LogWarning("Could not verify knife skill after game update (" + reason + "). Allowing Mouse5 sequence as compatibility fallback.");
+                Logger.LogWarning("[DPC] Could not verify knife skill (" + reason + "); allowing sequence as fallback.");
             }
             return true;
         }
@@ -462,17 +488,14 @@ namespace Goni.DaggerPerfectCancel
         {
             if (!_confirmAnimatorBlock.Value)
                 return true;
-
             if (_animatorField == null || _blockingAnimatorHashField == null || _animatorGetBool == null)
                 return AnimatorReflectionFallback("animator reflection unavailable");
-
             try
             {
                 var animator = _animatorField.GetValue(player);
                 var hashValue = _blockingAnimatorHashField.GetValue(null);
                 if (animator == null || hashValue == null)
-                    return AnimatorReflectionFallback("animator/hash was null");
-
+                    return AnimatorReflectionFallback("animator/hash null");
                 var blocking = _animatorGetBool.Invoke(animator, new[] { hashValue });
                 return blocking is bool b && b;
             }
@@ -487,7 +510,7 @@ namespace Goni.DaggerPerfectCancel
             if (!_warnedAnimatorReflection)
             {
                 _warnedAnimatorReflection = true;
-                Logger.LogWarning("Animator block confirmation unavailable (" + reason + "). Falling back to Player.IsBlocking().");
+                Logger.LogWarning("[DPC] Animator confirmation unavailable (" + reason + "); using IsBlocking only.");
             }
             return true;
         }
@@ -496,7 +519,6 @@ namespace Goni.DaggerPerfectCancel
         {
             if (method == null || instance == null)
                 return false;
-
             try
             {
                 var result = method.Invoke(instance, null);
@@ -504,7 +526,7 @@ namespace Goni.DaggerPerfectCancel
             }
             catch (Exception ex)
             {
-                _log?.LogWarning("State reflection failed: " + ex.GetType().Name + ": " + ex.Message);
+                _log?.LogWarning("[DPC] State reflection failed: " + ex.GetType().Name + ": " + ex.Message);
                 return false;
             }
         }
@@ -539,7 +561,6 @@ namespace Goni.DaggerPerfectCancel
         {
             if (_state != SequenceState.Idle)
                 DebugLog("Idle <- " + reason);
-
             _state = SequenceState.Idle;
             _stateStartedTicks = 0;
             _blockPressSent = false;
