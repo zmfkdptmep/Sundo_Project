@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>Goni.DaggerPerfectCancel</AssemblyName>
+    <RootNamespace>Goni.DaggerPerfectCancel</RootNamespace>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CoffeeNova.Valheim.ManagedReferences" Version="1.2214.6" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
