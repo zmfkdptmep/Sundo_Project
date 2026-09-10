@@ -1,0 +1,98 @@
+name: Build Foresight StreamSafe
+
+on:
+  push:
+    branches:
+      - chatgpt/foresight-streamsafe-build-20260911
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout build inputs
+        uses: actions/checkout@v4
+
+      - name: Checkout Valheim Foresight v2.0.1
+        uses: actions/checkout@v4
+        with:
+          repository: CoffeeNova/Valheim.Foresight
+          ref: v2.0.1
+          path: foresight
+          fetch-depth: 1
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: nuget/setup-nuget@v2
+        with:
+          nuget-version: latest
+
+      - name: Apply StreamSafe patch
+        shell: pwsh
+        run: |
+          $patchDir = Join-Path $env:GITHUB_WORKSPACE ".chatgpt/foresight-streamsafe"
+          $srcDir = Join-Path $env:GITHUB_WORKSPACE "foresight/src/Valheim.Foresight"
+
+          Copy-Item (Join-Path $patchDir "StreamSafeOverlay.cs") (Join-Path $srcDir "Services/Hud/StreamSafeOverlay.cs") -Force
+          Copy-Item (Join-Path $patchDir "EnemyHudPatch.cs") (Join-Path $srcDir "Patches/EnemyHudPatch.cs") -Force
+
+          $pluginPath = Join-Path $srcDir "ValheimForesightPlugin.cs"
+          $plugin = Get-Content $pluginPath -Raw
+          $needle = "        _threatCache.Clear();`r`n`r`n        CastbarRenderer?.Dispose();"
+          if (-not $plugin.Contains($needle)) {
+            $needle = "        _threatCache.Clear();`n`n        CastbarRenderer?.Dispose();"
+          }
+          if (-not $plugin.Contains($needle)) {
+            throw "Could not find DisablePlugin patch point"
+          }
+          $replacement = "        _threatCache.Clear();`r`n        StreamSafeOverlay.Shutdown();`r`n`r`n        CastbarRenderer?.Dispose();"
+          $plugin = $plugin.Replace($needle, $replacement)
+          Set-Content -Path $pluginPath -Value $plugin -Encoding UTF8
+
+          $pluginInfo = @'
+          namespace Valheim.Foresight.Autogen;
+
+          internal static class PluginInfoGenerated
+          {
+              internal const string PluginVersion = "2.0.1";
+              internal const string PluginName = "Valheim Foresight";
+              internal const string PluginGuid = "coffeenova.valheim.foresight";
+          }
+          '@
+          Set-Content -Path (Join-Path $srcDir "Autogen/PluginInfoGenerated.cs") -Value $pluginInfo -Encoding UTF8
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          nuget restore foresight/src/Valheim.Foresight/Valheim.Foresight.csproj -PackagesDirectory foresight/src/packages
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          msbuild foresight/src/Valheim.Foresight/Valheim.Foresight.csproj `
+            /p:Configuration=Release `
+            /p:Platform=AnyCPU `
+            /p:Version=2.0.1 `
+            /p:AssemblyVersion=2.0.1.0 `
+            /p:FileVersion=2.0.1.0
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "artifact"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "foresight/src/Valheim.Foresight/bin/Release/Valheim.Foresight.dll" $out -Force
+          Copy-Item ".chatgpt/foresight-streamsafe/STREAMSAFE-README.txt" $out -Force
+          Get-FileHash "$out/Valheim.Foresight.dll" -Algorithm SHA256 | Format-List | Out-File "$out/SHA256.txt"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Valheim-Foresight-2.0.1-StreamSafe
+          path: artifact/*
+          if-no-files-found: error
