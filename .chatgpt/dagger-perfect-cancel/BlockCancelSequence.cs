@@ -5,23 +5,33 @@ namespace Goni.DaggerPerfectCancel
     // Pure input state machine: no game objects, attack creation or game-state writes.
     internal sealed class BlockCancelSequence
     {
-        internal enum Stage { Idle, FirstPress, WaitFirstStart, WaitFirstEnd, WaitBlockApplied, SecondHold, Releasing, WaitRelease }
+        internal enum Stage { Idle, FirstPress, WaitFirstStart, WaitFirstEnd, WaitBlockApplied, SecondHold, Releasing, WaitRelease, SwordDualHold }
         internal struct Controls
         {
-            internal bool Override, Attack, AttackHold, Block, BlockHold;
+            internal bool Override, Attack, AttackHold, Block, BlockHold, SecondaryAttack, SecondaryAttackHold;
         }
         internal Stage Current { get; private set; }
         internal bool Running => Current != Stage.Idle && Current != Stage.WaitRelease;
         internal double HoldSeconds = 1.2, StartTimeout = 1.5, EndTimeout = 6.0, BlockTimeout = 1.5;
+        internal double SwordHoldTimeout = 6.0;
+        internal bool SwordMode { get; private set; }
+        internal int SecondarySwingCount { get; private set; }
+        internal const int SwordSwingTarget = 3;
         internal Action<Stage, string> Transition;
         private double _since;
         private bool _blockApplied, _secondPressConsumed, _releaseConsumed;
+        private bool _secondAttackAccepted, _secondSwingObserved, _dualPrimaryConsumed, _secondaryPressConsumed;
+        private double _secondAcceptedAt;
         private Controls _last;
 
-        internal bool Begin(double now)
+        internal bool Begin(double now, bool swordMode = false)
         {
             if (Current != Stage.Idle) return false;
             _blockApplied = _secondPressConsumed = _releaseConsumed = false;
+            _secondAttackAccepted = _secondSwingObserved = _dualPrimaryConsumed = _secondaryPressConsumed = false;
+            _secondAcceptedAt = 0;
+            SwordMode = swordMode;
+            SecondarySwingCount = 0;
             _last = default;
             Move(Stage.FirstPress, now, "Mouse5: sending one primary click");
             return true;
@@ -42,27 +52,60 @@ namespace Goni.DaggerPerfectCancel
             else if (Current == Stage.WaitBlockApplied && age > BlockTimeout)
                 Cancel(now, "game did not apply blocking");
             if (Current == Stage.WaitBlockApplied && _blockApplied)
-                Move(Stage.SecondHold, now, "engine UpdateBlock applied blocking; release RMB + hold LMB");
-            if (Current == Stage.SecondHold && now - _since >= HoldSeconds)
+                Move(Stage.SecondHold, now, SwordMode
+                    ? "engine UpdateBlock applied blocking; release RMB + one primary click"
+                    : "engine UpdateBlock applied blocking; release RMB + hold LMB");
+            if (Current == Stage.SecondHold && SwordMode)
+            {
+                if (!_secondAttackAccepted && now - _since > StartTimeout)
+                    Cancel(now, "post-block sword primary was not accepted");
+                else if (_secondAttackAccepted && (!_secondSwingObserved || !_secondPressConsumed) && now - _secondAcceptedAt > EndTimeout)
+                    Cancel(now, "post-block sword primary event/input acknowledgement was not observed");
+                else if (_secondPressConsumed && _secondAttackAccepted && _secondSwingObserved)
+                    Move(Stage.SwordDualHold, now, "one post-block primary melee event observed; hold LMB + secondary together");
+            }
+            if (Current == Stage.SecondHold && !SwordMode && now - _since >= HoldSeconds)
                 Move(Stage.Releasing, now, "primary hold elapsed; releasing inputs (combo result not inferred)");
+            if (Current == Stage.SwordDualHold && now - _since > SwordHoldTimeout)
+                Cancel(now, "sword follow-up watchdog: only " + SecondarySwingCount + "/3 secondary melee events observed");
             if (Current == Stage.Releasing && _releaseConsumed)
                 Move(Stage.WaitRelease, now, "neutral controls consumed");
 
             var controls = new Controls { Override = Running };
             if (Current == Stage.FirstPress) { controls.Attack = true; controls.AttackHold = true; }
             else if (Current == Stage.WaitBlockApplied) { controls.Block = true; controls.BlockHold = true; }
-            else if (Current == Stage.SecondHold) { controls.Attack = !_secondPressConsumed; controls.AttackHold = true; }
+            else if (Current == Stage.SecondHold)
+            {
+                controls.Attack = !_secondPressConsumed;
+                // Sword: exactly one post-block click, with no primary auto-repeat
+                // while waiting for its real melee event. Other weapons retain 3.1.
+                controls.AttackHold = !SwordMode || !_secondPressConsumed;
+            }
+            else if (Current == Stage.SwordDualHold)
+            {
+                controls.Attack = !_dualPrimaryConsumed;
+                controls.AttackHold = true;
+                controls.SecondaryAttack = !_secondaryPressConsumed;
+                controls.SecondaryAttackHold = true;
+            }
             return _last = controls;
         }
         // Acknowledge only AFTER vanilla PlayerAttackInput processed the emitted input.
         // Repeated SetControls calls cannot erase a click before its consumer sees it.
-        internal void AttackInputProcessed(bool attackInput, bool attackHoldInput, bool blockInput, bool inAttack, double now)
+        internal void AttackInputProcessed(bool attackInput, bool attackHoldInput, bool blockInput, bool inAttack, double now,
+            bool secondaryAttackInput = false, bool secondaryAttackHoldInput = false)
         {
             if (Current == Stage.FirstPress && _last.Attack && attackInput)
                 Move(Stage.WaitFirstStart, now, "vanilla consumed first primary input");
             else if (Current == Stage.SecondHold && _last.Attack && attackInput)
                 _secondPressConsumed = true;
-            else if (Current == Stage.Releasing && _last.Override && !attackInput && !attackHoldInput && !blockInput)
+            else if (Current == Stage.SwordDualHold)
+            {
+                if (_last.Attack && attackInput) _dualPrimaryConsumed = true;
+                if (_last.SecondaryAttack && secondaryAttackInput) _secondaryPressConsumed = true;
+            }
+            else if (Current == Stage.Releasing && _last.Override && !attackInput && !attackHoldInput && !blockInput
+                && !secondaryAttackInput && !secondaryAttackHoldInput)
                 _releaseConsumed = true;
             ObserveAttack(inAttack, now);
         }
@@ -79,6 +122,30 @@ namespace Goni.DaggerPerfectCancel
             // flag set by a real UpdateBlock call, following our emitted block input.
             if (Current == Stage.WaitBlockApplied && _last.BlockHold && isBlocking && internalBlockingState)
                 _blockApplied = true;
+        }
+        // These notifications observe vanilla success/events. They never call
+        // StartAttack, create attacks, or modify damage, stamina or chain fields.
+        internal bool PrimaryAttackAccepted(double now)
+        {
+            if (!SwordMode || Current != Stage.SecondHold || !_last.Override
+                || (!_last.Attack && !_secondPressConsumed)) return false;
+            if (!_secondAttackAccepted) _secondAcceptedAt = now;
+            _secondAttackAccepted = true;
+            return true;
+        }
+        internal void SecondPrimaryMeleeObserved()
+        {
+            if (SwordMode && Current == Stage.SecondHold && _secondAttackAccepted)
+                _secondSwingObserved = true;
+        }
+        internal bool SecondaryMeleeObserved(double now)
+        {
+            if (!SwordMode || Current != Stage.SwordDualHold || !_last.Override
+                || !_last.AttackHold || !_last.SecondaryAttackHold) return false;
+            ++SecondarySwingCount;
+            if (SecondarySwingCount == SwordSwingTarget)
+                Move(Stage.Releasing, now, "three secondary melee events observed; releasing both inputs");
+            return true;
         }
         internal void Cancel(double now, string reason)
         {

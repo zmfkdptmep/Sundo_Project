@@ -5,6 +5,7 @@ on:
     branches:
       - chatgpt/valheim-dagger-perfect-cancel-20260911
       - chatgpt/valheim-localhud-input-fix-20260911
+      - chatgpt/valheim-sword-followup-20260911
   workflow_dispatch:
 
 permissions:
@@ -47,6 +48,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Goni-State-Driven-Block-Cancel-3.1.0
+          name: Goni-State-Driven-Block-Cancel-3.2.0-SwordFollowup
           path: artifact/*
           if-no-files-found: error

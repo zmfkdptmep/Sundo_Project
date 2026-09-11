@@ -10,7 +10,8 @@ static class Program
         if (!condition) throw new Exception(message);
     }
     static void Neutral(BlockCancelSequence.Controls c, string message) =>
-        Check(c.Override && !c.Attack && !c.AttackHold && !c.Block && !c.BlockHold, message);
+        Check(c.Override && !c.Attack && !c.AttackHold && !c.Block && !c.BlockHold
+            && !c.SecondaryAttack && !c.SecondaryAttackHold, message);
 
     static BlockCancelSequence Started()
     {
@@ -87,5 +88,6 @@ static class Program
         departed.Rearm(false, .22);
         Check(departed.Begin(.23), "player replacement does not leave state machine stuck");
         Console.WriteLine($"PASS: {_checks} state/input assertions; 63 swing-duration scenarios. This is not a Valheim gameplay test.");
+        SwordTests.Run();
     }
 }
