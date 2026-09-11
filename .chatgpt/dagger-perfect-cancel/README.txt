@@ -57,6 +57,8 @@ DualHoldTimeoutSeconds는 실패 시 입력을 해제하는 한도입니다.
 기존 요구대로 정상 입력만 주입합니다. 공격 객체 생성, StartAttack 직접 호출,
 Attack.Stop, 공격/애니메이션/콤보/데미지/스태미나 값 수정은 하지 않습니다.
 읽기 관찰용 후크로 두 번째 평타 및 후속 보조 판정을 확인합니다.
+다른 모드가 원래 공격 함수를 건너뛴 경우에는 완료된 판정으로 세지 않습니다.
+이미 게임이 예약한 공격을 게임 필드 수정으로 강제 취소하지는 않습니다.
 검 관찰 API가 맞지 않으면 확장만 비활성화하고 기존 평캔은 유지합니다.
 
 코드의 이벤트 순서와 기존 3.1과의 입력 비교를 자동 검증합니다.
@@ -67,3 +69,4 @@ Attack.Stop, 공격/애니메이션/콤보/데미지/스태미나 값 수정은 
 결과가 다르면 검 이름, 3연타 여부, 스태미나 변화와 BepInEx/LogOutput.log가 필요합니다.
 
 빌드 대상: .NET Framework 4.8 / CoffeeNova.Valheim.ManagedReferences 1.2214.6
+관찰 후크 참고: https://harmony.pardeike.net/v2/articles/patching-injections.html

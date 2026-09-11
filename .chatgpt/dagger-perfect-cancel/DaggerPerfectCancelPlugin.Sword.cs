@@ -86,10 +86,10 @@ namespace Goni.DaggerPerfectCancel
                 ? self : null;
         }
 
-        private static void SwordAttackStarted(Humanoid __instance, bool secondaryAttack, bool __result)
+        private static void SwordAttackStarted(Humanoid __instance, bool secondaryAttack, bool __result, bool __runOriginal)
         {
             var self = ActiveSword();
-            if (self == null || __instance != self._owner || secondaryAttack || !__result) return;
+            if (self == null || __instance != self._owner || secondaryAttack || !__result || !__runOriginal) return;
             try
             {
                 if (self._sequence.PrimaryAttackAccepted(Time.realtimeSinceStartup))
@@ -98,10 +98,10 @@ namespace Goni.DaggerPerfectCancel
             catch (Exception ex) { self.CancelAndRelease("sword start observation failed: " + ex.Message); }
         }
 
-        private static void SwordMeleeCompleted(Attack __instance)
+        private static void SwordMeleeCompleted(Attack __instance, bool __runOriginal)
         {
             var self = ActiveSword();
-            if (self == null) return;
+            if (self == null || !__runOriginal) return;
             try
             {
                 // DoMeleeAttack runs once per swing, even on a miss. Do not count
