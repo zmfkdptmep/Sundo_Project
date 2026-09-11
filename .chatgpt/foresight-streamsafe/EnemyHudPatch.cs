@@ -50,8 +50,26 @@ internal class EnemyHudPatch
                     holder.originalName = nameLabel.text;
                 }
 
-                if (!ValheimForesightPlugin.TryGetThreatAssessment(character, out var assessment) || assessment == null)
+                var hudParent = nameLabel.transform.parent ?? nameLabel.transform;
+
+                // IMPORTANT: perform vanilla/local-camera visibility filtering BEFORE creating or
+                // activating any Foresight icon/castbar. EnemyHud keeps pooled entries alive even
+                // when their character is off-screen or the hierarchy is hidden. Rendering first
+                // and filtering afterwards lets stale/remote pooled bars become visible when the
+                // StreamSafe overlay reparents them away from their hidden vanilla parent.
+                if (!IsActuallyVisibleHud(character, nameLabel))
+                {
+                    RestoreVanillaLabel(nameLabel, holder.originalName);
+                    HideForesightExtras(hudParent);
                     continue;
+                }
+
+                if (!ValheimForesightPlugin.TryGetThreatAssessment(character, out var assessment) || assessment == null)
+                {
+                    RestoreVanillaLabel(nameLabel, holder.originalName);
+                    HideForesightExtras(hudParent);
+                    continue;
+                }
 
                 ColorizeByThreatLevel(nameLabel, assessment.Level);
 
@@ -62,7 +80,6 @@ internal class EnemyHudPatch
                 ValheimForesightPlugin.HudIconRenderer?.RenderIcon(nameLabel, hint);
 
                 var activeAttack = ValheimForesightPlugin.ActiveAttackTracker?.GetActiveAttack(character);
-                var hudParent = nameLabel.transform.parent ?? nameLabel.transform;
                 ValheimForesightPlugin.CastbarRenderer?.RenderCastbar(hudParent, activeAttack, character);
 
                 if (ValheimForesightPlugin.InstanceDebugHudEnabled)
@@ -71,24 +88,7 @@ internal class EnemyHudPatch
                     nameLabel.text = holder.originalName;
 
                 if (streamSafe)
-                {
-                    // EnemyHud keeps pooled HUD objects alive for characters that are not currently
-                    // visible.  Those objects can sit at a sentinel/off-screen UI position and are
-                    // normally hidden by the vanilla hierarchy.  Never clone such labels into the
-                    // native overlay: doing so makes every nearby/off-camera creature name pile up
-                    // at that sentinel position.
-                    if (IsActuallyVisibleHud(character, nameLabel))
-                    {
-                        StreamSafeOverlay.CaptureAndHide(character, nameLabel, hudParent, holder.originalName);
-                    }
-                    else
-                    {
-                        // Leave the vanilla hidden HUD hierarchy alone, but make sure no Foresight
-                        // colour/text leaks into a future vanilla frame before the object is reused.
-                        nameLabel.text = holder.originalName;
-                        nameLabel.color = Color.white;
-                    }
-                }
+                    StreamSafeOverlay.CaptureAndHide(character, nameLabel, hudParent, holder.originalName);
             }
         }
         finally
@@ -96,6 +96,29 @@ internal class EnemyHudPatch
             if (streamSafe)
                 StreamSafeOverlay.EndFrame();
         }
+    }
+
+    private static void RestoreVanillaLabel(TextMeshProUGUI nameLabel, string vanillaName)
+    {
+        if (nameLabel == null)
+            return;
+
+        nameLabel.text = vanillaName;
+        nameLabel.color = Color.white;
+    }
+
+    private static void HideForesightExtras(Transform hudParent)
+    {
+        if (hudParent == null)
+            return;
+
+        var icon = hudParent.Find("Foresight_ThreatIcon");
+        if (icon != null && icon.gameObject.activeSelf)
+            icon.gameObject.SetActive(false);
+
+        var castbar = hudParent.Find("Foresight_Castbar");
+        if (castbar != null && castbar.gameObject.activeSelf)
+            castbar.gameObject.SetActive(false);
     }
 
     private static bool IsActuallyVisibleHud(Character character, TextMeshProUGUI nameLabel)
@@ -109,8 +132,12 @@ internal class EnemyHudPatch
         if (!nameLabel.enabled || !nameLabel.gameObject.activeInHierarchy)
             return false;
 
+        var hudParent = nameLabel.transform.parent;
+        if (hudParent != null && !hudParent.gameObject.activeInHierarchy)
+            return false;
+
         // Respect the same effective visibility the vanilla UI hierarchy uses.
-        // The pooled EnemyHud entries for off-camera creatures commonly have alpha 0 upstream.
+        // Pooled EnemyHud entries for off-camera creatures commonly have alpha 0 upstream.
         try
         {
             if (nameLabel.canvasRenderer != null && nameLabel.canvasRenderer.GetAlpha() <= 0.01f)
@@ -132,30 +159,32 @@ internal class EnemyHudPatch
             {
                 if (group == null || !group.enabled)
                     continue;
+
                 effectiveAlpha *= group.alpha;
                 if (effectiveAlpha <= 0.01f)
                     return false;
             }
         }
 
-        // A pooled HUD can still own a perfectly valid RectTransform while its character is behind
-        // the camera or outside the viewport.  Verify the world object itself, not only the UI rect.
+        // Verify against THIS CLIENT'S active game camera. Remote players do not own a local game
+        // camera, so this also prevents any remote/pooled HUD state from being promoted merely
+        // because its RectTransform contains stale on-screen coordinates.
         var camera = Camera.main;
-        if (camera != null)
-        {
-            var worldPoint = character.transform.position + Vector3.up * 1.2f;
-            var sp = camera.WorldToScreenPoint(worldPoint);
-            if (sp.z <= 0.01f)
-                return false;
+        if (camera == null || !camera.isActiveAndEnabled)
+            return false;
 
-            const float edgeTolerance = 32f;
-            if (sp.x < -edgeTolerance || sp.x > Screen.width + edgeTolerance ||
-                sp.y < -edgeTolerance || sp.y > Screen.height + edgeTolerance)
-                return false;
-        }
+        var worldPoint = character.transform.position + Vector3.up * 1.2f;
+        var sp = camera.WorldToScreenPoint(worldPoint);
+        if (sp.z <= 0.01f)
+            return false;
 
-        // Finally require the actual name rect itself to overlap the screen. Do not clamp an invalid
-        // off-screen/sentinel rect into the visible area.
+        const float edgeTolerance = 8f;
+        if (sp.x < -edgeTolerance || sp.x > Screen.width + edgeTolerance ||
+            sp.y < -edgeTolerance || sp.y > Screen.height + edgeTolerance)
+            return false;
+
+        // Finally require the actual vanilla name rect itself to overlap the screen. Never clamp a
+        // stale sentinel/off-screen rect into the StreamSafe visible region.
         var rect = GetScreenRect(nameLabel.rectTransform);
         if (rect.width <= 0.5f || rect.height <= 0.5f)
             return false;
