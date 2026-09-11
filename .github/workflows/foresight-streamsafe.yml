@@ -5,6 +5,7 @@ on:
     branches:
       - chatgpt/foresight-streamsafe-build-20260911
       - chatgpt/valheim-localhud-input-fix-20260911
+      - chatgpt/foresight-streamsafe-r3-20260911
   workflow_dispatch:
 
 permissions:
@@ -28,6 +29,15 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      - name: Setup .NET for regression checks
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
+
+      - name: Verify capture exclusion fallback
+        shell: pwsh
+        run: dotnet run --project .chatgpt/foresight-overlay-tests/Foresight.Overlay.Tests.csproj -c Release
+
       - name: Setup NuGet
         uses: nuget/setup-nuget@v2
         with:
@@ -40,6 +50,7 @@ jobs:
           $srcDir = Join-Path $env:GITHUB_WORKSPACE "foresight/src/Valheim.Foresight"
 
           Copy-Item (Join-Path $patchDir "StreamSafeOverlay.cs") (Join-Path $srcDir "Services/Hud/StreamSafeOverlay.cs") -Force
+          Copy-Item (Join-Path $patchDir "CaptureExclusionPolicy.cs") (Join-Path $srcDir "Services/Hud/CaptureExclusionPolicy.cs") -Force
           Copy-Item (Join-Path $patchDir "EnemyHudPatch.cs") (Join-Path $srcDir "Patches/EnemyHudPatch.cs") -Force
 
           $pluginPath = Join-Path $srcDir "ValheimForesightPlugin.cs"
@@ -94,6 +105,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Valheim-Foresight-2.0.1-StreamSafe-LocalHUD-r2
+          name: Valheim-Foresight-2.0.1-StreamSafe-LocalHUD-r3
           path: artifact/*
           if-no-files-found: error

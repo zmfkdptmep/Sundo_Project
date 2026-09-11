@@ -34,6 +34,7 @@ internal static class StreamSafeOverlay
     private static bool _failed;
     private static int _lastFrame = -1;
     private static int _orphanCount;
+    private static bool _loggedFirstPublish;
 
     internal static bool IsAvailable => EnsureInitialized();
 
@@ -155,7 +156,14 @@ internal static class StreamSafeOverlay
                     }
 
                     if (window.Update(rect, pixels, width, height))
+                    {
                         PublishedThisFrame.Add(key);
+                        if (!_loggedFirstPublish)
+                        {
+                            _loggedFirstPublish = true;
+                            ValheimForesightPlugin.Log?.LogInfo("[StreamSafeOverlay] First overlay frame published.");
+                        }
+                    }
                 }
             }
             finally
@@ -203,6 +211,8 @@ internal static class StreamSafeOverlay
         _renderHeight = 0;
         _initialized = false;
         _failed = false;
+        _loggedFirstPublish = false;
+        NativeMethods.ResetDiagnostics();
         _lastFrame = -1;
         Regions.Clear();
         SeenThisFrame.Clear();
@@ -253,7 +263,7 @@ internal static class StreamSafeOverlay
 
             EnsureRenderTarget();
             _initialized = true;
-            ValheimForesightPlugin.Log?.LogInfo("[StreamSafeOverlay] LocalHUD r2: capture-excluded overlay enabled; owner cleanup and fresh-frame publishing active.");
+            ValheimForesightPlugin.Log?.LogInfo("[StreamSafeOverlay] LocalHUD r3: renderer ready; capture exclusion will be checked when each native window is created.");
             return true;
         }
         catch (Exception ex)
@@ -500,11 +510,23 @@ internal static class StreamSafeOverlay
     private sealed class NativeRegionWindow : IDisposable
     {
         private IntPtr _hwnd; private IntPtr _memoryDc; private IntPtr _dib; private IntPtr _oldBitmap; private IntPtr _bits; private int _width; private int _height; private bool _disposed;
+        private float _nextCreateAttempt;
         internal bool Update(Rect unityRect, Color32[] pixels, int width, int height)
         {
             if (_disposed) return false;
             if (!NativeMethods.TryGetGameClient(out var gameWindow, out var origin, out var clientWidth, out var clientHeight)) { Hide(); return false; }
-            if (_hwnd == IntPtr.Zero) { _hwnd = NativeMethods.CreateOverlayWindow(gameWindow); if (_hwnd == IntPtr.Zero) return false; }
+            if (_hwnd == IntPtr.Zero)
+            {
+                if (Time.realtimeSinceStartup < _nextCreateAttempt) return false;
+                _hwnd = NativeMethods.CreateOverlayWindow(gameWindow);
+                if (_hwnd == IntPtr.Zero)
+                {
+                    // A transient/native API failure affects only this window.
+                    // Keep it hidden and retry, without disabling the renderer.
+                    _nextCreateAttempt = Time.realtimeSinceStartup + 2f;
+                    return false;
+                }
+            }
             EnsureBitmap(width, height); if (_bits == IntPtr.Zero) return false;
             CopyPixelsPremultipliedAndFlip(pixels, width, height, _bits);
             var x = origin.X + Mathf.RoundToInt(unityRect.xMin);
@@ -541,6 +563,8 @@ internal static class StreamSafeOverlay
     {
         internal const int SW_HIDE = 0; private const int SW_SHOWNOACTIVATE = 4; private const uint WS_POPUP = 0x80000000; private const uint WS_EX_LAYERED = 0x00080000; private const uint WS_EX_TRANSPARENT = 0x00000020; private const uint WS_EX_TOOLWINDOW = 0x00000080; private const uint WS_EX_NOACTIVATE = 0x08000000; private const uint ULW_ALPHA = 0x00000002; private const byte AC_SRC_OVER = 0x00; private const byte AC_SRC_ALPHA = 0x01; private const uint WDA_EXCLUDEFROMCAPTURE = 0x00000011; private const int WCA_EXCLUDED_FROM_DDA = 24; private const uint SWP_NOACTIVATE = 0x0010; private const uint SWP_SHOWWINDOW = 0x0040; private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         private static readonly WndProcDelegate WndProc = WindowProc; private static ushort _classAtom; private static string? _className;
+        private static string? _lastExclusionStatus;
+        internal static void ResetDiagnostics() => _lastExclusionStatus = null;
         [StructLayout(LayoutKind.Sequential)] internal struct POINT { internal int X; internal int Y; }
         [StructLayout(LayoutKind.Sequential)] internal struct SIZE { internal int cx; internal int cy; }
         [StructLayout(LayoutKind.Sequential)] internal struct RECT { internal int Left; internal int Top; internal int Right; internal int Bottom; }
@@ -574,25 +598,37 @@ internal static class StreamSafeOverlay
             EnsureClass(); if (_classAtom == 0 || string.IsNullOrEmpty(_className)) return IntPtr.Zero;
             var hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, _className!, "Foresight StreamSafe Overlay", WS_POPUP, 0, 0, 1, 1, owner, IntPtr.Zero, Marshal.GetHINSTANCE(typeof(StreamSafeOverlay).Module), IntPtr.Zero);
             if (hwnd == IntPtr.Zero) return IntPtr.Zero;
-            if (!SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
+            var result = CaptureExclusionPolicy.Apply(
+                () => SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE),
+                () => ExcludeFromDesktopDuplication(hwnd),
+                Marshal.GetLastWin32Error);
+            var diagnostic = result.Diagnostic;
+            if (diagnostic != _lastExclusionStatus)
             {
-                var error = Marshal.GetLastWin32Error();
-                DestroyWindow(hwnd);
-                throw new InvalidOperationException($"Capture exclusion failed (Win32 {error}).");
+                _lastExclusionStatus = diagnostic;
+                if (result.CanPublish)
+                    ValheimForesightPlugin.Log?.LogInfo($"[StreamSafeOverlay] Capture exclusion: {diagnostic}. Native overlay enabled; verify the capture preview.");
+                else
+                    ValheimForesightPlugin.Log?.LogWarning($"[StreamSafeOverlay] Capture exclusion: {diagnostic}. This window remains hidden; retrying in 2 seconds.");
             }
+            if (!result.CanPublish)
+            {
+                DestroyWindow(hwnd);
+                return IntPtr.Zero;
+            }
+            return hwnd;
+        }
+
+        private static bool ExcludeFromDesktopDuplication(IntPtr hwnd)
+        {
+            var ptr = Marshal.AllocHGlobal(sizeof(int));
             try
             {
-                var ptr = Marshal.AllocHGlobal(sizeof(int));
-                try
-                {
-                    Marshal.WriteInt32(ptr, 1);
-                    var data = new WINDOWCOMPOSITIONATTRIBDATA { Attrib = WCA_EXCLUDED_FROM_DDA, pvData = ptr, cbData = sizeof(int) };
-                    SetWindowCompositionAttribute(hwnd, ref data);
-                }
-                finally { Marshal.FreeHGlobal(ptr); }
+                Marshal.WriteInt32(ptr, 1);
+                var data = new WINDOWCOMPOSITIONATTRIBDATA { Attrib = WCA_EXCLUDED_FROM_DDA, pvData = ptr, cbData = sizeof(int) };
+                return SetWindowCompositionAttribute(hwnd, ref data) != 0;
             }
-            catch { }
-            return hwnd;
+            finally { Marshal.FreeHGlobal(ptr); }
         }
 
         internal static bool TryGetGameClient(out IntPtr gameWindow, out POINT origin, out int width, out int height)
