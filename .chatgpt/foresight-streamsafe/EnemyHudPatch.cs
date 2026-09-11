@@ -29,7 +29,7 @@ internal class EnemyHudPatch
         try
         {
             var player = Player.m_localPlayer;
-            if (player == null || !Application.isFocused || Hud.IsUserHidden())
+            if (player == null || !Application.isFocused || global::Hud.IsUserHidden())
                 return;
 
             var huds = EnemyHudPrivateAccess.GetHudsAsDictionary(__instance);

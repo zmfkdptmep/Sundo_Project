@@ -408,7 +408,7 @@ internal static class StreamSafeOverlay
         private void Update()
         {
             if (!Application.isFocused || Player.m_localPlayer == null ||
-                Hud.IsUserHidden() || Time.frameCount > _lastFrame + 1)
+                global::Hud.IsUserHidden() || Time.frameCount > _lastFrame + 1)
             {
                 HideAllNativeWindows();
                 RestoreMovedUi();

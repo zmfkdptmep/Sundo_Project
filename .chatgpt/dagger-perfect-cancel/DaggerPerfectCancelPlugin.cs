@@ -20,6 +20,7 @@ namespace Goni.DaggerPerfectCancel
         private readonly BlockCancelSequence _sequence = new BlockCancelSequence();
         // Observations only: no SetValue calls or game-field writes.
         private FieldInfo _engineBlocking, _attackInput, _attackHoldInput, _blockInput;
+        private MethodInfo _takeInput;
         private ConfigEntry<bool> _enabled, _verbose, _eitherSideButton;
         private ConfigEntry<int> _triggerKey, _holdMs;
         private ConfigEntry<float> _startTimeout, _endTimeout, _blockTimeout;
@@ -56,6 +57,7 @@ namespace Goni.DaggerPerfectCancel
                 var controls = AccessTools.Method(typeof(Player), "SetControls");
                 var attackConsumer = AccessTools.Method(typeof(Player), "PlayerAttackInput");
                 var blockUpdate = AccessTools.Method(typeof(Humanoid), "UpdateBlock");
+                _takeInput = AccessTools.Method(typeof(Player), "TakeInput");
                 _engineBlocking = AccessTools.Field(typeof(Humanoid), "m_internalBlockingState");
                 _attackInput = AccessTools.Field(typeof(Character), "m_attack");
                 _attackHoldInput = AccessTools.Field(typeof(Character), "m_attackHold");
@@ -64,7 +66,8 @@ namespace Goni.DaggerPerfectCancel
                 if (controls == null || !controls.GetParameters().Select(p => p.Name).SequenceEqual(names) ||
                     controls.GetParameters()[0].ParameterType != typeof(Vector3) ||
                     controls.GetParameters().Skip(1).Any(p => p.ParameterType != typeof(bool)) ||
-                    attackConsumer == null || blockUpdate == null ||
+                    attackConsumer == null || blockUpdate == null || _takeInput == null ||
+                    _takeInput.ReturnType != typeof(bool) || _takeInput.GetParameters().Length != 0 ||
                     new[] { _engineBlocking, _attackInput, _attackHoldInput, _blockInput }.Any(f => f == null || f.FieldType != typeof(bool)))
                     throw new InvalidOperationException("Unsupported game control API; expected SetControls, PlayerAttackInput, UpdateBlock and read-only bool observations.");
 
@@ -171,9 +174,10 @@ namespace Goni.DaggerPerfectCancel
         private bool CanContinue(Player player) => CanUsePlayer(player) && player == _owner && ReferenceEquals(player.GetCurrentWeapon(), _weapon);
         private static bool CanUsePlayer(Player player) => Application.isFocused && Time.timeScale > 0f &&
             player != null && player == Player.m_localPlayer && player.gameObject.activeInHierarchy &&
-            !player.IsDead() && player.TakeInput() && !player.InPlaceMode() && !player.InDodge() &&
+            !player.IsDead() && TakesInput(player) && !player.InPlaceMode() && !player.InDodge() &&
             !player.IsStaggering() && !player.IsAttached() && !player.InMinorAction() && player.GetDoodadController() == null;
         private static bool ReadBool(FieldInfo field, object target) => (bool)field.GetValue(target);
+        private static bool TakesInput(Player player) => (bool)_instance._takeInput.Invoke(player, null);
         private static bool ReadKey(int key)
         {
             try { return (GetAsyncKeyState(key) & 0x8000) != 0; }
@@ -198,7 +202,7 @@ namespace Goni.DaggerPerfectCancel
             try
             {
                 _releasing = true;
-                var focused = Application.isFocused && _owner.TakeInput();
+                var focused = Application.isFocused && TakesInput(_owner);
                 // Cleanup also uses normal controls, never private-field writes.
                 _owner.SetControls(focused ? _rawMove : Vector3.zero, false, false, false, false,
                     false, false, false, false, focused && _rawRun, false, false);
