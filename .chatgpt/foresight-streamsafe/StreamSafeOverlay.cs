@@ -20,6 +20,9 @@ internal static class StreamSafeOverlay
     private static readonly List<MovedUi> Moved = new();
     private static readonly Dictionary<int, Rect> Regions = new();
     private static readonly HashSet<int> SeenThisFrame = new();
+    private static readonly HashSet<int> PublishedThisFrame = new();
+    private static readonly HashSet<int> CapturedHuds = new();
+    private static readonly List<int> RetiredKeys = new();
 
     private static GameObject? _root;
     private static Camera? _camera;
@@ -29,17 +32,23 @@ internal static class StreamSafeOverlay
     private static int _renderHeight;
     private static bool _initialized;
     private static bool _failed;
+    private static int _lastFrame = -1;
+    private static int _orphanCount;
 
     internal static bool IsAvailable => EnsureInitialized();
 
+    // Run BEFORE vanilla can remove a HUD. Children temporarily on the overlay must
+    // belong to their owner again when EnemyHud destroys that owner's hierarchy.
+    internal static void PrepareHudUpdate() => RestoreMovedUi();
+
     internal static void BeginFrame()
     {
-        if (!EnsureInitialized())
-            return;
-
         RestoreMovedUi();
         Regions.Clear();
         SeenThisFrame.Clear();
+        PublishedThisFrame.Clear();
+        CapturedHuds.Clear();
+        _lastFrame = Time.frameCount;
 
         foreach (var clone in NameClones.Values)
         {
@@ -47,7 +56,8 @@ internal static class StreamSafeOverlay
                 clone.Component.gameObject.SetActive(false);
         }
 
-        EnsureRenderTarget();
+        if (EnsureInitialized())
+            EnsureRenderTarget();
     }
 
     internal static void CaptureAndHide(Character character, TextMeshProUGUI nameLabel, Transform hudParent, string vanillaName)
@@ -56,7 +66,10 @@ internal static class StreamSafeOverlay
             return;
 
         var key = character.GetInstanceID();
-        SeenThisFrame.Add(key);
+        // Moving a HUD twice in one frame would make the renderer create another
+        // bar because the first one is no longer below hudParent.
+        if (SeenThisFrame.Contains(key) || !CapturedHuds.Add(hudParent.GetInstanceID()))
+            return;
         Rect? union = null;
 
         var nameRect = GetScreenRect(nameLabel.rectTransform);
@@ -73,7 +86,7 @@ internal static class StreamSafeOverlay
         }
 
         var icon = hudParent.Find("Foresight_ThreatIcon");
-        if (icon != null && icon.gameObject.activeSelf)
+        if (icon != null && icon.gameObject.activeInHierarchy)
         {
             var iconRect = GetScreenRect(icon as RectTransform ?? icon.GetComponent<RectTransform>());
             if (IsUsableRect(iconRect))
@@ -84,7 +97,7 @@ internal static class StreamSafeOverlay
         }
 
         var castbar = hudParent.Find("Foresight_Castbar");
-        if (castbar != null && castbar.gameObject.activeSelf)
+        if (castbar != null && castbar.gameObject.activeInHierarchy)
         {
             var castbarRect = GetScreenRect(castbar as RectTransform ?? castbar.GetComponent<RectTransform>());
             if (IsUsableRect(castbarRect))
@@ -98,7 +111,10 @@ internal static class StreamSafeOverlay
         nameLabel.color = Color.white;
 
         if (union.HasValue)
+        {
             Regions[key] = ClampAndPad(union.Value, Padding);
+            SeenThisFrame.Add(key);
+        }
     }
 
     internal static void EndFrame()
@@ -138,7 +154,8 @@ internal static class StreamSafeOverlay
                         Windows[key] = window;
                     }
 
-                    window.Update(rect, pixels, width, height);
+                    if (window.Update(rect, pixels, width, height))
+                        PublishedThisFrame.Add(key);
                 }
             }
             finally
@@ -146,11 +163,6 @@ internal static class StreamSafeOverlay
                 RenderTexture.active = previous;
             }
 
-            foreach (var pair in Windows)
-            {
-                if (!SeenThisFrame.Contains(pair.Key))
-                    pair.Value.Hide();
-            }
         }
         catch (Exception ex)
         {
@@ -158,6 +170,13 @@ internal static class StreamSafeOverlay
             ValheimForesightPlugin.Log?.LogWarning($"[StreamSafeOverlay] Overlay disabled after rendering failure: {ex.Message}");
             HideAllNativeWindows();
             RestoreMovedUi();
+        }
+        finally
+        {
+            // A visited character is not proof that fresh pixels were published.
+            foreach (var pair in Windows)
+                if (!PublishedThisFrame.Contains(pair.Key)) pair.Value.Hide();
+            RetireUnseenEntries();
         }
     }
 
@@ -184,6 +203,11 @@ internal static class StreamSafeOverlay
         _renderHeight = 0;
         _initialized = false;
         _failed = false;
+        _lastFrame = -1;
+        Regions.Clear();
+        SeenThisFrame.Clear();
+        PublishedThisFrame.Clear();
+        CapturedHuds.Clear();
     }
 
     private static bool EnsureInitialized()
@@ -201,6 +225,7 @@ internal static class StreamSafeOverlay
             _root = new GameObject("Foresight_StreamSafeOverlay");
             UnityEngine.Object.DontDestroyOnLoad(_root);
             _root.layer = OverlayLayer;
+            _root.AddComponent<OverlayLifetimeGuard>();
 
             var cameraObject = new GameObject("Foresight_StreamSafeCamera");
             cameraObject.transform.SetParent(_root.transform, false);
@@ -228,13 +253,13 @@ internal static class StreamSafeOverlay
 
             EnsureRenderTarget();
             _initialized = true;
-            ValheimForesightPlugin.Log?.LogInfo("[StreamSafeOverlay] Capture-excluded overlay enabled.");
+            ValheimForesightPlugin.Log?.LogInfo("[StreamSafeOverlay] LocalHUD r2: capture-excluded overlay enabled; owner cleanup and fresh-frame publishing active.");
             return true;
         }
         catch (Exception ex)
         {
             _failed = true;
-            ValheimForesightPlugin.Log?.LogWarning($"[StreamSafeOverlay] Could not initialize: {ex.Message}. Falling back to original HUD.");
+            ValheimForesightPlugin.Log?.LogWarning($"[StreamSafeOverlay] Could not initialize: {ex.Message}. Foresight indicators remain hidden.");
             return false;
         }
     }
@@ -323,7 +348,18 @@ internal static class StreamSafeOverlay
         {
             var state = Moved[i];
             var rect = state.RectTransform;
-            if (rect == null || state.Parent == null) continue;
+            if (rect == null) continue;
+            // Never leave an orphan active on the persistent overlay canvas. In the
+            // old DLL, `continue` here leaked every bar whose HUD was destroyed.
+            rect.gameObject.SetActive(false);
+            if (state.Parent == null)
+            {
+                UnityEngine.Object.Destroy(rect.gameObject);
+                ++_orphanCount;
+                if (_orphanCount == 1 || _orphanCount % 100 == 0)
+                    ValheimForesightPlugin.Log?.LogDebug($"[StreamSafeOverlay] Retired orphan UI objects: {_orphanCount}");
+                continue;
+            }
             rect.SetParent(state.Parent, false);
             rect.anchorMin = state.AnchorMin;
             rect.anchorMax = state.AnchorMax;
@@ -336,6 +372,51 @@ internal static class StreamSafeOverlay
             SetLayerRecursively(rect.gameObject, state.Layer);
         }
         Moved.Clear();
+    }
+
+    private static void RetireUnseenEntries()
+    {
+        RetiredKeys.Clear();
+        foreach (var key in NameClones.Keys)
+            if (!SeenThisFrame.Contains(key)) RetiredKeys.Add(key);
+        foreach (var key in RetiredKeys)
+        {
+            if (NameClones[key].Component != null)
+            {
+                NameClones[key].Component.gameObject.SetActive(false);
+                UnityEngine.Object.Destroy(NameClones[key].Component.gameObject);
+            }
+            NameClones.Remove(key);
+        }
+        RetiredKeys.Clear();
+        foreach (var key in Windows.Keys)
+            if (!SeenThisFrame.Contains(key)) RetiredKeys.Add(key);
+        foreach (var key in RetiredKeys) { Windows[key].Dispose(); Windows.Remove(key); }
+        RetiredKeys.Clear();
+        foreach (var key in Readbacks.Keys)
+            if (!SeenThisFrame.Contains(key)) RetiredKeys.Add(key);
+        foreach (var key in RetiredKeys)
+        {
+            if (Readbacks[key].Texture != null) UnityEngine.Object.Destroy(Readbacks[key].Texture);
+            Readbacks.Remove(key);
+        }
+        RetiredKeys.Clear();
+    }
+
+    private sealed class OverlayLifetimeGuard : MonoBehaviour
+    {
+        private void Update()
+        {
+            if (!Application.isFocused || Player.m_localPlayer == null ||
+                Hud.IsUserHidden() || Time.frameCount > _lastFrame + 1)
+            {
+                HideAllNativeWindows();
+                RestoreMovedUi();
+            }
+        }
+
+        private void OnApplicationFocus(bool focused) { if (!focused) HideAllNativeWindows(); }
+        private void OnApplicationQuit() { foreach (var window in Windows.Values) window.Dispose(); }
     }
 
     private static void PlaceOnOverlay(RectTransform source, RectTransform destination, Rect screenRect)
@@ -419,17 +500,17 @@ internal static class StreamSafeOverlay
     private sealed class NativeRegionWindow : IDisposable
     {
         private IntPtr _hwnd; private IntPtr _memoryDc; private IntPtr _dib; private IntPtr _oldBitmap; private IntPtr _bits; private int _width; private int _height; private bool _disposed;
-        internal void Update(Rect unityRect, Color32[] pixels, int width, int height)
+        internal bool Update(Rect unityRect, Color32[] pixels, int width, int height)
         {
-            if (_disposed) return;
-            if (!NativeMethods.TryGetGameClient(out var gameWindow, out var origin, out var clientWidth, out var clientHeight)) { Hide(); return; }
-            if (_hwnd == IntPtr.Zero) { _hwnd = NativeMethods.CreateOverlayWindow(gameWindow); if (_hwnd == IntPtr.Zero) return; }
-            EnsureBitmap(width, height); if (_bits == IntPtr.Zero) return;
+            if (_disposed) return false;
+            if (!NativeMethods.TryGetGameClient(out var gameWindow, out var origin, out var clientWidth, out var clientHeight)) { Hide(); return false; }
+            if (_hwnd == IntPtr.Zero) { _hwnd = NativeMethods.CreateOverlayWindow(gameWindow); if (_hwnd == IntPtr.Zero) return false; }
+            EnsureBitmap(width, height); if (_bits == IntPtr.Zero) return false;
             CopyPixelsPremultipliedAndFlip(pixels, width, height, _bits);
             var x = origin.X + Mathf.RoundToInt(unityRect.xMin);
             var y = origin.Y + clientHeight - Mathf.RoundToInt(unityRect.yMax);
-            if (!NativeMethods.IsGameForeground(gameWindow)) { Hide(); return; }
-            NativeMethods.UpdateLayered(_hwnd, _memoryDc, x, y, width, height);
+            if (!NativeMethods.IsGameForeground(gameWindow)) { Hide(); return false; }
+            return NativeMethods.UpdateLayered(_hwnd, _memoryDc, x, y, width, height);
         }
         private void EnsureBitmap(int width, int height)
         {
@@ -493,7 +574,12 @@ internal static class StreamSafeOverlay
             EnsureClass(); if (_classAtom == 0 || string.IsNullOrEmpty(_className)) return IntPtr.Zero;
             var hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, _className!, "Foresight StreamSafe Overlay", WS_POPUP, 0, 0, 1, 1, owner, IntPtr.Zero, Marshal.GetHINSTANCE(typeof(StreamSafeOverlay).Module), IntPtr.Zero);
             if (hwnd == IntPtr.Zero) return IntPtr.Zero;
-            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+            if (!SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
+            {
+                var error = Marshal.GetLastWin32Error();
+                DestroyWindow(hwnd);
+                throw new InvalidOperationException($"Capture exclusion failed (Win32 {error}).");
+            }
             try
             {
                 var ptr = Marshal.AllocHGlobal(sizeof(int));
@@ -521,11 +607,13 @@ internal static class StreamSafeOverlay
             var foreground = GetForegroundWindow(); if (foreground == gameWindow) return true; if (foreground == IntPtr.Zero) return false;
             GetWindowThreadProcessId(foreground, out var foregroundPid); return foregroundPid == (uint)Process.GetCurrentProcess().Id;
         }
-        internal static void UpdateLayered(IntPtr hwnd, IntPtr memoryDc, int x, int y, int width, int height)
+        internal static bool UpdateLayered(IntPtr hwnd, IntPtr memoryDc, int x, int y, int width, int height)
         {
             var dst = new POINT { X = x, Y = y }; var src = new POINT { X = 0, Y = 0 }; var size = new SIZE { cx = width, cy = height }; var blend = new BLENDFUNCTION { BlendOp = AC_SRC_OVER, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = AC_SRC_ALPHA };
-            UpdateLayeredWindow(hwnd, IntPtr.Zero, ref dst, ref size, memoryDc, ref src, 0, ref blend, ULW_ALPHA);
+            if (!UpdateLayeredWindow(hwnd, IntPtr.Zero, ref dst, ref size, memoryDc, ref src, 0, ref blend, ULW_ALPHA))
+                return false;
             SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW); ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            return true;
         }
         private static void EnsureClass()
         {

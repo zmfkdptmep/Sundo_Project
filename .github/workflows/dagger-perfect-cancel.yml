@@ -1,0 +1,52 @@
+name: Build State Driven Block Cancel
+
+on:
+  push:
+    branches:
+      - chatgpt/valheim-dagger-perfect-cancel-20260911
+      - chatgpt/valheim-localhud-input-fix-20260911
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore .chatgpt/dagger-perfect-cancel/Goni.DaggerPerfectCancel.csproj
+
+      - name: Build Release
+        shell: pwsh
+        run: dotnet build .chatgpt/dagger-perfect-cancel/Goni.DaggerPerfectCancel.csproj -c Release --no-restore
+
+      - name: Verify state and input sequencing
+        shell: pwsh
+        run: dotnet run --project .chatgpt/block-cancel-tests/BlockCancel.Tests.csproj -c Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "artifact"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item ".chatgpt/dagger-perfect-cancel/bin/Release/net48/Goni.DaggerPerfectCancel.dll" $out -Force
+          Copy-Item ".chatgpt/dagger-perfect-cancel/README.txt" $out -Force
+          Get-FileHash "$out/Goni.DaggerPerfectCancel.dll" -Algorithm SHA256 | Format-List | Out-File "$out/SHA256.txt"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Goni-State-Driven-Block-Cancel-3.1.0
+          path: artifact/*
+          if-no-files-found: error

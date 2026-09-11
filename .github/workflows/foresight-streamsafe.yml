@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - chatgpt/foresight-streamsafe-build-20260911
+      - chatgpt/valheim-localhud-input-fix-20260911
   workflow_dispatch:
 
 permissions:
@@ -93,6 +94,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Valheim-Foresight-2.0.1-StreamSafe
+          name: Valheim-Foresight-2.0.1-StreamSafe-LocalHUD-r2
           path: artifact/*
           if-no-files-found: error

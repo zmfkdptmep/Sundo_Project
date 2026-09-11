@@ -1,4 +1,7 @@
 using System.Collections;
+using System.Collections.Generic;
+using System.Reflection;
+using HarmonyLib;
 using TMPro;
 using UnityEngine;
 using Valheim.Foresight.HarmonyRefs;
@@ -9,6 +12,9 @@ namespace Valheim.Foresight.Patches;
 
 internal class EnemyHudPatch
 {
+    private static readonly HashSet<int> RenderedHuds = new();
+    private static FieldInfo? _hudCharacterField;
+    private static FieldInfo? _hudGuiField;
     private static readonly Color SafeColor = Color.white;
     private static readonly Color CautionColor = new(1f, 0.75f, 0.25f);
     private static readonly Color BlockLethalColor = new(1f, 0.5f, 0.1f);
@@ -17,13 +23,13 @@ internal class EnemyHudPatch
     internal static void LateUpdatePostfix(EnemyHud __instance)
     {
         var streamSafe = StreamSafeOverlay.IsAvailable;
-        if (streamSafe)
-            StreamSafeOverlay.BeginFrame();
+        StreamSafeOverlay.BeginFrame();
+        RenderedHuds.Clear();
 
         try
         {
             var player = Player.m_localPlayer;
-            if (player == null)
+            if (player == null || !Application.isFocused || Hud.IsUserHidden())
                 return;
 
             var huds = EnemyHudPrivateAccess.GetHudsAsDictionary(__instance);
@@ -57,12 +63,21 @@ internal class EnemyHudPatch
                 // when their character is off-screen or the hierarchy is hidden. Rendering first
                 // and filtering afterwards lets stale/remote pooled bars become visible when the
                 // StreamSafe overlay reparents them away from their hidden vanilla parent.
-                if (!IsActuallyVisibleHud(character, nameLabel))
+                if (!streamSafe || !IsCurrentHud(character, hudObj) || !IsActuallyVisibleHud(character, nameLabel))
                 {
                     RestoreVanillaLabel(nameLabel, holder.originalName);
                     HideForesightExtras(hudParent);
                     continue;
                 }
+
+                // A pooled HUD can only contribute once, even if two dictionary keys
+                // briefly refer to it. Check before RenderIcon/RenderCastbar reparent it.
+                if (!RenderedHuds.Add(hudParent.GetInstanceID()))
+                    continue;
+
+                // Vanilla refreshes the visible label in UpdateHuds. Retain that frame's
+                // name instead of the name of an earlier owner of a pooled label.
+                holder.originalName = nameLabel.text;
 
                 if (!ValheimForesightPlugin.TryGetThreatAssessment(character, out var assessment) || assessment == null)
                 {
@@ -71,31 +86,49 @@ internal class EnemyHudPatch
                     continue;
                 }
 
-                ColorizeByThreatLevel(nameLabel, assessment.Level);
+                try
+                {
+                    ColorizeByThreatLevel(nameLabel, assessment.Level);
 
-                ThreatResponseHint hint;
-                try { hint = ValheimForesightPlugin.ThreatResponseHintService.GetHint(assessment); }
-                catch { hint = ThreatResponseHint.None; }
+                    ThreatResponseHint hint;
+                    try { hint = ValheimForesightPlugin.ThreatResponseHintService.GetHint(assessment); }
+                    catch { hint = ThreatResponseHint.None; }
 
-                ValheimForesightPlugin.HudIconRenderer?.RenderIcon(nameLabel, hint);
+                    ValheimForesightPlugin.HudIconRenderer?.RenderIcon(nameLabel, hint);
 
-                var activeAttack = ValheimForesightPlugin.ActiveAttackTracker?.GetActiveAttack(character);
-                ValheimForesightPlugin.CastbarRenderer?.RenderCastbar(hudParent, activeAttack, character);
+                    var activeAttack = ValheimForesightPlugin.ActiveAttackTracker?.GetActiveAttack(character);
+                    ValheimForesightPlugin.CastbarRenderer?.RenderCastbar(hudParent, activeAttack, character);
 
-                if (ValheimForesightPlugin.InstanceDebugHudEnabled)
-                    AppendDebugInfo(nameLabel, holder.originalName, assessment);
-                else
-                    nameLabel.text = holder.originalName;
+                    if (ValheimForesightPlugin.InstanceDebugHudEnabled)
+                        AppendDebugInfo(nameLabel, holder.originalName, assessment);
+                    else
+                        nameLabel.text = holder.originalName;
 
-                if (streamSafe)
                     StreamSafeOverlay.CaptureAndHide(character, nameLabel, hudParent, holder.originalName);
+                }
+                finally
+                {
+                    // Off-screen rectangles or a render exception must never expose
+                    // untransferred Foresight UI in the captured game framebuffer.
+                    RestoreVanillaLabel(nameLabel, holder.originalName);
+                    HideForesightExtras(hudParent);
+                }
             }
         }
         finally
         {
-            if (streamSafe)
-                StreamSafeOverlay.EndFrame();
+            StreamSafeOverlay.EndFrame();
         }
+    }
+
+    private static bool IsCurrentHud(Character character, object hud)
+    {
+        _hudCharacterField ??= AccessTools.Field(hud.GetType(), "m_character");
+        _hudGuiField ??= AccessTools.Field(hud.GetType(), "m_gui");
+        if (_hudCharacterField == null || _hudGuiField == null) return false;
+        var owner = _hudCharacterField.GetValue(hud) as Character;
+        var gui = _hudGuiField.GetValue(hud) as GameObject;
+        return owner == character && gui != null && gui.activeInHierarchy;
     }
 
     private static void RestoreVanillaLabel(TextMeshProUGUI nameLabel, string vanillaName)
@@ -112,13 +145,9 @@ internal class EnemyHudPatch
         if (hudParent == null)
             return;
 
-        var icon = hudParent.Find("Foresight_ThreatIcon");
-        if (icon != null && icon.gameObject.activeSelf)
-            icon.gameObject.SetActive(false);
-
-        var castbar = hudParent.Find("Foresight_Castbar");
-        if (castbar != null && castbar.gameObject.activeSelf)
-            castbar.gameObject.SetActive(false);
+        foreach (Transform child in hudParent)
+            if (child.name == "Foresight_ThreatIcon" || child.name == "Foresight_Castbar")
+                child.gameObject.SetActive(false);
     }
 
     private static bool IsActuallyVisibleHud(Character character, TextMeshProUGUI nameLabel)
@@ -155,25 +184,30 @@ internal class EnemyHudPatch
             if (groups == null)
                 continue;
 
+            var ignoreParents = false;
             foreach (var group in groups)
             {
                 if (group == null || !group.enabled)
                     continue;
 
                 effectiveAlpha *= group.alpha;
+                ignoreParents |= group.ignoreParentGroups;
                 if (effectiveAlpha <= 0.01f)
                     return false;
             }
+            if (ignoreParents) break;
         }
 
         // Verify against THIS CLIENT'S active game camera. Remote players do not own a local game
         // camera, so this also prevents any remote/pooled HUD state from being promoted merely
         // because its RectTransform contains stale on-screen coordinates.
-        var camera = Camera.main;
+        var camera = Utils.GetMainCamera();
         if (camera == null || !camera.isActiveAndEnabled)
             return false;
 
-        var worldPoint = character.transform.position + Vector3.up * 1.2f;
+        var worldPoint = character.IsPlayer()
+            ? character.GetHeadPoint() + Vector3.up * 0.3f
+            : character.GetTopPoint();
         var sp = camera.WorldToScreenPoint(worldPoint);
         if (sp.z <= 0.01f)
             return false;
@@ -252,4 +286,14 @@ internal class EnemyHudPatch
     {
         public string originalName = string.Empty;
     }
+}
+
+// The upstream plugin registers the postfix explicitly. This separate prefix is
+// picked up by its existing PatchAll call and restores ownership before vanilla.
+[HarmonyPatch(typeof(EnemyHud), "LateUpdate")]
+internal static class EnemyHudRestorePatch
+{
+    [HarmonyPrefix]
+    [HarmonyPriority(Priority.First)]
+    private static void Prefix() => StreamSafeOverlay.PrepareHudUpdate();
 }
