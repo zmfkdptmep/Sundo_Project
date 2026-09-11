@@ -1,54 +1,57 @@
-Goni Dagger Perfect Cancel 1.0.0
-=================================
+Goni Universal Perfect Block Cancel 2.0.0
+=========================================
 
-Client-side BepInEx plugin for Valheim.
+Client-side BepInEx plugin for Valheim 1.0.x.
 
-Goal
-----
-Mouse5 (XBUTTON2) automates the same knife block-cancel sequence a player can perform manually, but it watches Valheim's internal action state instead of using a fixed millisecond delay.
+What it does
+------------
+Hold Mouse5.
 
-Default behavior
-----------------
-1. Hold Mouse5.
-2. If idle, the plugin requests the first primary knife attack.
-   - You may alternatively start the first attack manually and press Mouse5 while that attack is active.
-3. It waits until Player.InAttack() actually becomes false.
-4. It requests block.
-5. It waits until Player.IsBlocking() becomes true.
-6. When available, it additionally waits until the underlying Animator blocking bool is true.
-7. It releases block.
-8. It waits until IsBlocking() is actually false.
-9. It requests primary attack on every control tick until Valheim accepts the first legal post-block attack frame.
-10. It then holds primary attack for as long as Mouse5 remains held.
+For every eligible primary attack cycle the plugin does:
+  NORMAL PRIMARY ATTACK
+  -> waits for the REAL Attack.OnAttackTrigger event (the actual hit/projectile trigger)
+  -> removes only the post-hit recovery portion
+  -> shows a very short block pose
+  -> directly starts the next NORMAL PRIMARY ATTACK
+  -> repeats while Mouse5 is held
 
-This is not a fixed-timing macro. Millisecond values in the config are fail-safe timeouts only.
+This is not a millisecond macro and it does not attempt to hit the normal human block-cancel timing window.
+The recovery transition is driven from Valheim's combat objects after the legitimate hit event has already fired.
+
+Preserved vanilla behavior
+--------------------------
+- Real attack hit event still fires normally.
+- Normal damage calculation is untouched.
+- Normal attack stamina/eitr/health cost is untouched.
+- Normal ammo/projectile trigger work is untouched.
+- Vanilla combo-chain state is preserved by keeping the finished attack as previousAttack.
+- Stagger, dodge, no-stamina, menus, death, etc. can still make StartAttack illegal. The plugin retries instead of corrupting those states.
+
+Visual sequence
+---------------
+The default BlockVisualFrames=1 keeps the inserted block very short so it resembles a perfect manual block cancel rather than an artificial attack-speed animation.
 
 Install
 -------
-Copy Goni.DaggerPerfectCancel.dll into:
+Replace the old Goni.DaggerPerfectCancel.dll with this DLL in:
   Valheim\BepInEx\plugins\
 
-Requirements
-------------
-- BepInExPack for Valheim
-- Windows (Mouse5 is read with Win32 GetAsyncKeyState / XBUTTON2)
-- Client side only; do not install on the dedicated server.
+Do not keep old 1.x copies in another plugins subfolder.
+Client side only. Do not install on the dedicated server.
 
 Config
 ------
-Created after first launch at:
-  Valheim\BepInEx\config\goni.valheim.daggerperfectcancel.cfg
+Valheim\BepInEx\config\goni.valheim.daggerperfectcancel.cfg
 
-Useful settings:
+Important settings:
 - Enabled = true
-- RequireKnife = true
-- ConfirmAnimatorBlock = true
+- TriggerVirtualKey = 6       (0x06 = XBUTTON2 / normally Mouse5)
+- BlockVisualFrames = 1       (increase to 2 if you want the shield/block pose more obvious)
+- FastForwardNormalizedTime = 0.97
+- RestartRetrySeconds = 0.05
 - VerboseLogging = false
-- TriggerVirtualKey = 6  (0x06 = XBUTTON2 / usually Mouse5)
 
-Notes
------
-- The plugin does not change attack animation speed, stamina cost, damage, or combo values.
-- It only overrides primary-attack and block input while Mouse5 is held; movement/camera/other controls remain vanilla.
-- A server-side anti-animation-cancel mod can intentionally prevent the combo carry and therefore defeat this plugin.
-- Stamina, stagger, dodge, death, equipment changes, or another mod changing Player.SetControls can still prevent an attack from being legal; no client automation can make an engine-rejected action valid without changing game rules.
+Weapon coverage
+---------------
+The mod no longer checks the Knives skill. It drives the currently equipped weapon's PRIMARY attack.
+Normal melee weapons/tools that fire Attack.OnAttackTrigger are the main target. Unusual draw/reload/looping attacks are allowed to use the same hook, but the safety timeout releases/restarts the cycle if that weapon does not use the normal attack-trigger path.
