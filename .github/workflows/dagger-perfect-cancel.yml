@@ -1,4 +1,4 @@
-name: Build Universal Perfect Block Cancel
+name: Build True Extended Block Cancel
 
 on:
   push:
@@ -42,6 +42,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Goni-Universal-Perfect-Block-Cancel-2.0.0
+          name: Goni-True-Extended-Block-Cancel-2.1.0
           path: artifact/*
           if-no-files-found: error
