@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
@@ -15,8 +16,8 @@ namespace Goni.DaggerPerfectCancel
     public sealed class DaggerPerfectCancelPlugin : BaseUnityPlugin
     {
         public const string PluginGuid = "goni.valheim.daggerperfectcancel";
-        public const string PluginName = "Goni Universal Perfect Block Cancel";
-        public const string PluginVersion = "2.0.0";
+        public const string PluginName = "Goni True Extended Block Cancel";
+        public const string PluginVersion = "2.1.0";
 
         private const int VkXButton1 = 0x05;
         private const int VkXButton2 = 0x06;
@@ -26,58 +27,58 @@ namespace Goni.DaggerPerfectCancel
         private static ManualLogSource _log;
 
         private Harmony _harmony;
-
         private Type _playerType;
         private Type _humanoidType;
         private Type _attackType;
-        private Type _zsyncAnimationType;
 
         private FieldInfo _localPlayerField;
         private FieldInfo _currentAttackField;
         private FieldInfo _previousAttackField;
         private FieldInfo _timeSinceLastAttackField;
-        private FieldInfo _blockingInputField;
-        private FieldInfo _internalBlockingStateField;
-        private FieldInfo _animatorField;
-        private FieldInfo _zanimField;
-        private FieldInfo _blockingHashField;
+        private FieldInfo _attackNextChainField;
+        private FieldInfo _attackChainLevelsField;
         private FieldInfo _attackCharacterField;
+        private FieldInfo _blockingInputField;
 
+        private MethodInfo _setControlsMethod;
         private MethodInfo _startAttackMethod;
         private MethodInfo _getCurrentWeaponMethod;
         private MethodInfo _inAttackMethod;
+        private MethodInfo _isBlockingMethod;
         private MethodInfo _attackTriggerMethod;
-        private MethodInfo _attackStopMethod;
         private MethodInfo _attackIsDoneMethod;
-        private MethodInfo _zanimSetBoolMethod;
+
+        private int _attackIndex = -1;
+        private int _attackHoldIndex = -1;
+        private int _blockIndex = -1;
+        private int _blockHoldIndex = -1;
 
         private ConfigEntry<bool> _enabled;
-        private ConfigEntry<bool> _acceptEitherSideButton;
         private ConfigEntry<int> _triggerVirtualKey;
-        private ConfigEntry<int> _blockVisualFrames;
-        private ConfigEntry<float> _attackTriggerTimeoutSeconds;
-        private ConfigEntry<float> _restartRetrySeconds;
-        private ConfigEntry<float> _fastForwardNormalizedTime;
+        private ConfigEntry<bool> _acceptEitherSideButton;
+        private ConfigEntry<int> _blockVisibleFrames;
+        private ConfigEntry<float> _bridgeRetryInterval;
+        private ConfigEntry<float> _bridgeTimeout;
         private ConfigEntry<bool> _verbose;
 
         private CycleState _state = CycleState.Idle;
         private object _player;
-        private object _trackedAttack;
+        private object _firstAttack;
+        private object _bridgeAttack;
+        private bool _firstHitSeen;
         private bool _mouseWasDown;
-        private bool _forceInAttackFalse;
-        private int _blockStartedFrame;
-        private int _renderFramesWithBlock;
-        private float _stateStartedRealtime;
-        private float _nextRestartAttempt;
-        private bool _warnedFastForward;
-        private bool _warnedBlockVisual;
+        private int _blockObservedFrame = -1;
+        private float _stateStarted;
+        private float _nextBridgeAttempt;
+        private bool _warnedChainReflection;
 
         private enum CycleState
         {
             Idle,
-            WaitingForHit,
-            ShowingBlock,
-            Restarting
+            FirstAttack,
+            RaiseRealBlock,
+            StartExtendedBridge,
+            HoldVanillaCombo
         }
 
         [DllImport("user32.dll")]
@@ -89,43 +90,40 @@ namespace Goni.DaggerPerfectCancel
             _log = Logger;
 
             _enabled = Config.Bind("General", "Enabled", true,
-                "Hold Mouse5 to repeatedly perform primary attack -> visible block flash -> next primary attack.");
-            _acceptEitherSideButton = Config.Bind("Input", "AcceptEitherSideButtonFallback", true,
-                "Also accept XBUTTON1 if mouse software swaps the side-button numbering.");
+                "Hold Mouse5 to force the real Valheim block-carry/extended-combo sequence.");
             _triggerVirtualKey = Config.Bind("Input", "TriggerVirtualKey", VkXButton2,
-                "Primary Win32 virtual-key code. Decimal 6 / 0x06 is XBUTTON2, normally Mouse5.");
-            _blockVisualFrames = Config.Bind("Visual", "BlockVisualFrames", 1,
-                "Rendered frames to keep the synthetic block visible between attacks. 1 is the minimum and fastest.");
-            _attackTriggerTimeoutSeconds = Config.Bind("Safety", "AttackTriggerTimeoutSeconds", 3.0f,
-                "If a weapon never fires an attack trigger, release the cycle instead of hanging forever.");
-            _restartRetrySeconds = Config.Bind("Safety", "RestartRetrySeconds", 0.05f,
-                "Retry interval if the game temporarily refuses the next attack because of stamina, stagger, dodge, etc.");
-            _fastForwardNormalizedTime = Config.Bind("Visual", "FastForwardNormalizedTime", 0.97f,
-                "After the hit event, jump the current attack animation near its end before showing block. This removes recovery without skipping the hit itself.");
+                "Win32 virtual-key code. 6 / 0x06 is XBUTTON2 (Mouse5 on this PC).");
+            _acceptEitherSideButton = Config.Bind("Input", "AcceptEitherSideButtonFallback", false,
+                "Also accept XBUTTON1. Disabled by default because the supplied runtime log confirms Mouse5 is VK 0x06.");
+            _blockVisibleFrames = Config.Bind("Visual", "BlockVisibleFrames", 1,
+                "Keep the real blocking state visible for this many rendered frames after IsBlocking() becomes true.");
+            _bridgeRetryInterval = Config.Bind("Safety", "BridgeRetryInterval", 0.01f,
+                "Retry interval if Valheim temporarily refuses the post-block combo attack.");
+            _bridgeTimeout = Config.Bind("Safety", "BridgeTimeout", 1.0f,
+                "Give up and fall back to held primary if the post-block bridge cannot start in this many seconds.");
             _verbose = Config.Bind("Debug", "VerboseLogging", false,
-                "Write every perfect-cancel state transition to LogOutput.log.");
+                "Log every state transition and chain level.");
 
-            if (!InitializeReflection())
+            if (!BindGameMembers())
             {
-                Logger.LogError("[UPC] Could not bind required Valheim 1.0 combat members. Mod disabled.");
+                Logger.LogError("[TEC] Required Valheim 1.0 combat members were not found. Mod disabled.");
                 _enabled.Value = false;
                 return;
             }
 
             _harmony = new Harmony(PluginGuid);
+            _harmony.Patch(_setControlsMethod,
+                prefix: new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), nameof(SetControlsPrefix)));
             _harmony.Patch(_attackTriggerMethod,
                 postfix: new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), nameof(AttackTriggerPostfix)));
-            _harmony.Patch(_inAttackMethod,
-                postfix: new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), nameof(InAttackPostfix)));
 
-            Logger.LogInfo(
-                PluginName + " " + PluginVersion +
-                " loaded. Mouse5 uses real Attack.OnAttackTrigger events; all primary weapons are eligible.");
+            Logger.LogInfo(PluginName + " " + PluginVersion +
+                " loaded. Mouse5 = first primary -> real block startup -> preserved combo carry -> vanilla primary hold.");
         }
 
         private void OnDestroy()
         {
-            try { EndCycle(restoreBlock: true, reason: "plugin unload"); } catch { }
+            try { StopAutomation("plugin unload"); } catch { }
             try { _harmony?.UnpatchSelf(); } catch { }
             _instance = null;
             _log = null;
@@ -136,18 +134,18 @@ namespace Goni.DaggerPerfectCancel
             if (_enabled == null || !_enabled.Value)
             {
                 if (_state != CycleState.Idle)
-                    EndCycle(true, "disabled");
+                    StopAutomation("disabled");
                 return;
             }
 
-            var down = IsTriggerDown(out var inputSource);
+            var down = IsTriggerDown(out var source);
             var pressed = down && !_mouseWasDown;
             _mouseWasDown = down;
 
             if (!down)
             {
                 if (_state != CycleState.Idle)
-                    EndCycle(true, "Mouse5 released");
+                    StopAutomation("Mouse5 released");
                 return;
             }
 
@@ -156,104 +154,68 @@ namespace Goni.DaggerPerfectCancel
                 return;
 
             if (pressed)
-                Logger.LogInfo("[UPC] Mouse5 detected via " + inputSource + ".");
+                Logger.LogInfo("[TEC] Mouse5 detected via " + source + ".");
 
             if (_state == CycleState.Idle)
             {
                 _player = local;
-                ArmOrStartAttack(local);
+                BeginFirstAttack(local);
                 return;
             }
 
             if (!ReferenceEquals(local, _player))
             {
-                EndCycle(true, "local player changed");
+                StopAutomation("local player changed");
                 return;
             }
 
             switch (_state)
             {
-                case CycleState.WaitingForHit:
-                    // Some unusual attacks can finish without the standard OnAttackTrigger event.
-                    // If that happens, re-arm rather than leaving the button dead forever.
-                    if (_trackedAttack == null || IsAttackDone(_trackedAttack))
-                    {
-                        DebugLog("tracked attack ended without a trigger; restarting");
-                        _state = CycleState.Restarting;
-                        _nextRestartAttempt = Time.realtimeSinceStartup;
-                        break;
-                    }
-
-                    if (Time.realtimeSinceStartup - _stateStartedRealtime > _attackTriggerTimeoutSeconds.Value)
-                    {
-                        DebugLog("attack trigger timeout; restarting");
-                        _state = CycleState.Restarting;
-                        _nextRestartAttempt = Time.realtimeSinceStartup;
-                    }
+                case CycleState.FirstAttack:
+                    UpdateFirstAttack();
                     break;
 
-                case CycleState.ShowingBlock:
-                    // The block flag is set in the hit-event postfix. Count actual rendered frames,
-                    // not milliseconds, so the pose is guaranteed to reach the screen at least once.
-                    if (Time.frameCount > _blockStartedFrame)
-                        _renderFramesWithBlock++;
-
-                    if (_renderFramesWithBlock >= Mathf.Max(1, _blockVisualFrames.Value))
-                    {
-                        ClearSyntheticBlock(_player);
-                        _forceInAttackFalse = false;
-                        _state = CycleState.Restarting;
-                        _nextRestartAttempt = Time.realtimeSinceStartup;
-                        DebugLog("block frame shown; starting next primary attack");
-                    }
+                case CycleState.RaiseRealBlock:
+                    UpdateRealBlock();
                     break;
 
-                case CycleState.Restarting:
-                    if (Time.realtimeSinceStartup >= _nextRestartAttempt)
-                    {
-                        if (TryStartPrimary(_player, bypassAnimatorAttackState: true))
-                        {
-                            TrackCurrentAttack(_player);
-                        }
-                        else
-                        {
-                            // Respect real game blockers (no stamina, stagger, dodge, menus, etc.).
-                            // There is no timing gamble: retry until the engine accepts the attack.
-                            _nextRestartAttempt = Time.realtimeSinceStartup + Mathf.Max(0.01f, _restartRetrySeconds.Value);
-                        }
-                    }
+                case CycleState.StartExtendedBridge:
+                    UpdateExtendedBridge();
+                    break;
+
+                case CycleState.HoldVanillaCombo:
+                    // Nothing to manufacture here. Player.SetControls is patched to supply only
+                    // attackHold=true. From this point onward Valheim's own combo system owns all
+                    // attacks, animation events, stamina use, multi-hit finishers and chain damage.
                     break;
             }
         }
 
-        private bool InitializeReflection()
+        private bool BindGameMembers()
         {
             _playerType = AccessTools.TypeByName("Player");
             _humanoidType = AccessTools.TypeByName("Humanoid");
             _attackType = AccessTools.TypeByName("Attack");
-            _zsyncAnimationType = AccessTools.TypeByName("ZSyncAnimation");
             if (_playerType == null || _humanoidType == null || _attackType == null)
                 return false;
 
             _localPlayerField = AccessTools.Field(_playerType, "m_localPlayer");
-            _currentAttackField = FindFieldInHierarchy(_humanoidType, "m_currentAttack");
-            _previousAttackField = FindFieldInHierarchy(_humanoidType, "m_previousAttack");
-            _timeSinceLastAttackField = FindFieldInHierarchy(_humanoidType, "m_timeSinceLastAttack");
-            _blockingInputField = FindFieldInHierarchy(_playerType, "m_blocking");
-            _internalBlockingStateField = FindFieldInHierarchy(_humanoidType, "m_internalBlockingState");
-            _animatorField = FindFieldInHierarchy(_humanoidType, "m_animator");
-            _zanimField = FindFieldInHierarchy(_humanoidType, "m_zanim");
-            _blockingHashField = AccessTools.Field(_humanoidType, "s_blocking");
-            _attackCharacterField = FindFieldInHierarchy(_attackType, "m_character");
+            _currentAttackField = FindField(_humanoidType, "m_currentAttack");
+            _previousAttackField = FindField(_humanoidType, "m_previousAttack");
+            _timeSinceLastAttackField = FindField(_humanoidType, "m_timeSinceLastAttack");
+            _blockingInputField = FindField(_playerType, "m_blocking") ?? FindField(_humanoidType, "m_blocking");
+
+            _attackNextChainField = FindField(_attackType, "m_nextAttackChainLevel");
+            _attackChainLevelsField = FindField(_attackType, "m_attackChainLevels");
+            _attackCharacterField = FindField(_attackType, "m_character");
 
             _getCurrentWeaponMethod = AccessTools.Method(_humanoidType, "GetCurrentWeapon", Type.EmptyTypes);
             _inAttackMethod = AccessTools.Method(_humanoidType, "InAttack", Type.EmptyTypes);
+            _isBlockingMethod = AccessTools.Method(_humanoidType, "IsBlocking", Type.EmptyTypes);
             _attackTriggerMethod = AccessTools.Method(_attackType, "OnAttackTrigger", Type.EmptyTypes);
-            _attackStopMethod = AccessTools.Method(_attackType, "Stop", Type.EmptyTypes);
             _attackIsDoneMethod = AccessTools.Method(_attackType, "IsDone", Type.EmptyTypes);
 
-            _startAttackMethod = _humanoidType
-                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            _startAttackMethod = _humanoidType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
                 .FirstOrDefault(m =>
                 {
                     if (m.Name != "StartAttack") return false;
@@ -261,278 +223,324 @@ namespace Goni.DaggerPerfectCancel
                     return p.Length == 2 && p[1].ParameterType == typeof(bool);
                 });
 
-            if (_zsyncAnimationType != null)
+            _setControlsMethod = _playerType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .Where(m => m.Name == "SetControls")
+                .OrderByDescending(m => m.GetParameters().Length)
+                .FirstOrDefault(m => HasControlLayout(m.GetParameters()));
+
+            if (_setControlsMethod != null)
             {
-                _zanimSetBoolMethod = _zsyncAnimationType
-                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                    .FirstOrDefault(m =>
-                    {
-                        if (m.Name != "SetBool") return false;
-                        var p = m.GetParameters();
-                        return p.Length == 2 && p[0].ParameterType == typeof(int) && p[1].ParameterType == typeof(bool);
-                    });
+                var p = _setControlsMethod.GetParameters();
+                _attackIndex = FindParameter(p, "attack", 1);
+                _attackHoldIndex = FindParameter(p, "attackHold", 2);
+                _blockIndex = FindParameter(p, "block", 5);
+                _blockHoldIndex = FindParameter(p, "blockHold", 6);
             }
 
-            var ok = _localPlayerField != null &&
-                     _currentAttackField != null &&
-                     _previousAttackField != null &&
-                     _timeSinceLastAttackField != null &&
-                     _getCurrentWeaponMethod != null &&
-                     _inAttackMethod != null &&
-                     _startAttackMethod != null &&
-                     _attackTriggerMethod != null &&
-                     _attackStopMethod != null;
+            var ok = _localPlayerField != null && _currentAttackField != null &&
+                     _previousAttackField != null && _timeSinceLastAttackField != null &&
+                     _getCurrentWeaponMethod != null && _inAttackMethod != null &&
+                     _isBlockingMethod != null && _startAttackMethod != null &&
+                     _setControlsMethod != null && _attackTriggerMethod != null &&
+                     ValidIndex(_attackIndex) && ValidIndex(_attackHoldIndex) &&
+                     ValidIndex(_blockIndex) && ValidIndex(_blockHoldIndex);
 
-            Logger.LogInfo(
-                "[UPC] Combat hooks: currentAttack=" + Found(_currentAttackField) +
-                ", previousAttack=" + Found(_previousAttackField) +
-                ", timeSinceLastAttack=" + Found(_timeSinceLastAttackField) +
-                ", blocking=" + Found(_blockingInputField) +
-                ", internalBlock=" + Found(_internalBlockingStateField) +
-                ", animator=" + Found(_animatorField) +
-                ", zanim=" + Found(_zanimField) +
+            Logger.LogInfo("[TEC] Hooks: SetControls=" + Found(_setControlsMethod) +
                 ", StartAttack=" + Found(_startAttackMethod) +
-                ", OnAttackTrigger=" + Found(_attackTriggerMethod) + ".");
+                ", currentAttack=" + Found(_currentAttackField) +
+                ", previousAttack=" + Found(_previousAttackField) +
+                ", nextChain=" + Found(_attackNextChainField) +
+                ", chainLevels=" + Found(_attackChainLevelsField) +
+                ", IsBlocking=" + Found(_isBlockingMethod) + ".");
             return ok;
         }
 
-        private static string Found(MemberInfo member) => member != null ? "found" : "missing";
-
-        private static FieldInfo FindFieldInHierarchy(Type type, string name)
+        private void BeginFirstAttack(object player)
         {
-            for (var t = type; t != null; t = t.BaseType)
+            _firstHitSeen = false;
+            _blockObservedFrame = -1;
+            _firstAttack = GetCurrentAttack(player);
+
+            // Mouse5 can be pressed during a manually-started primary. If there is no attack,
+            // start hit #1 directly instead of relying on a synthetic button edge.
+            if (_firstAttack == null || IsAttackDone(_firstAttack))
             {
-                var field = t.GetField(name,
-                    BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public |
-                    BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
-                if (field != null)
-                    return field;
+                if (!TryStartPrimary(player))
+                {
+                    // Keep Idle and try again next Update while Mouse5 remains held.
+                    _state = CycleState.Idle;
+                    return;
+                }
+                _firstAttack = GetCurrentAttack(player);
             }
-            return null;
+
+            if (_firstAttack == null)
+                return;
+
+            _state = CycleState.FirstAttack;
+            _stateStarted = Time.realtimeSinceStartup;
+            DebugLog("first attack armed");
         }
 
-        private object GetLocalPlayer()
+        private void UpdateFirstAttack()
         {
-            try { return _localPlayerField?.GetValue(null); }
-            catch { return null; }
-        }
-
-        private void ArmOrStartAttack(object player)
-        {
-            // If Mouse5 is pressed during an already-running primary swing, use that swing as hit #1.
-            var current = GetCurrentAttack(player);
-            if (current != null && !IsAttackDone(current))
+            if (_firstAttack == null)
             {
-                _trackedAttack = current;
-                _state = CycleState.WaitingForHit;
-                _stateStartedRealtime = Time.realtimeSinceStartup;
-                DebugLog("armed existing attack");
+                StopAutomation("first attack disappeared");
                 return;
             }
 
-            if (TryStartPrimary(player, bypassAnimatorAttackState: false))
-                TrackCurrentAttack(player);
-            else
+            // Do NOT stop/fast-forward this attack. A real extended combo waits until the first
+            // swing naturally returns to the point where blocking can begin. The hit event is
+            // tracked only so we never cancel before the real attack event happened.
+            if (!_firstHitSeen)
+                return;
+
+            if (InvokeBool(_inAttackMethod, _player))
+                return;
+
+            EnsureFirstAttackCarriesChain();
+            _state = CycleState.RaiseRealBlock;
+            _stateStarted = Time.realtimeSinceStartup;
+            _blockObservedFrame = -1;
+            SetBlockingInputField(true);
+            DebugLog("first swing left attack state; requesting real block");
+        }
+
+        private void UpdateRealBlock()
+        {
+            SetBlockingInputField(true);
+
+            var blocking = InvokeBool(_isBlockingMethod, _player);
+            if (!blocking)
+                return;
+
+            if (_blockObservedFrame < 0)
             {
-                _state = CycleState.Restarting;
-                _nextRestartAttempt = Time.realtimeSinceStartup + Mathf.Max(0.01f, _restartRetrySeconds.Value);
-                DebugLog("initial attack not yet legal; retrying");
+                _blockObservedFrame = Time.frameCount;
+                DebugLog("IsBlocking=true; block startup reached screen path");
+                return;
+            }
+
+            if (Time.frameCount - _blockObservedFrame < Mathf.Max(1, _blockVisibleFrames.Value))
+                return;
+
+            // This is the exact bridge: the first Attack object and its m_nextAttackChainLevel
+            // survive across the block. Do not reset/clone it ourselves.
+            SetBlockingInputField(false);
+            PreserveFirstAttackAsPrevious();
+            _state = CycleState.StartExtendedBridge;
+            _stateStarted = Time.realtimeSinceStartup;
+            _nextBridgeAttempt = 0f;
+            DebugLog("block visibly entered; releasing and bridging into chain hit #2");
+        }
+
+        private void UpdateExtendedBridge()
+        {
+            if (Time.realtimeSinceStartup < _nextBridgeAttempt)
+                return;
+
+            SetBlockingInputField(false);
+            PreserveFirstAttackAsPrevious();
+
+            if (TryStartPrimary(_player))
+            {
+                _bridgeAttack = GetCurrentAttack(_player);
+                _state = CycleState.HoldVanillaCombo;
+                _stateStarted = Time.realtimeSinceStartup;
+                DebugLog("bridge attack accepted; handing control to vanilla attackHold");
+                return;
+            }
+
+            if (Time.realtimeSinceStartup - _stateStarted > Mathf.Max(0.2f, _bridgeTimeout.Value))
+            {
+                // Safer fallback: never spin StartAttack forever. Keep Mouse5 behaving as held LMB.
+                _state = CycleState.HoldVanillaCombo;
+                DebugLog("bridge timeout; falling back to vanilla hold");
+                return;
+            }
+
+            _nextBridgeAttempt = Time.realtimeSinceStartup + Mathf.Max(0.005f, _bridgeRetryInterval.Value);
+        }
+
+        private void EnsureFirstAttackCarriesChain()
+        {
+            if (_firstAttack == null || _attackNextChainField == null)
+                return;
+
+            try
+            {
+                var next = (int)_attackNextChainField.GetValue(_firstAttack);
+                var levels = _attackChainLevelsField != null ? (int)_attackChainLevelsField.GetValue(_firstAttack) : 0;
+
+                // Attack.Update normally sets next=current+1 when the attack animation first enters.
+                // If another mod or a frame edge left it at zero, force only the expected first->second
+                // carry for weapons that actually declare a combo chain. This is the only chain write.
+                if (levels > 1 && next == 0)
+                {
+                    _attackNextChainField.SetValue(_firstAttack, 1);
+                    next = 1;
+                }
+                DebugLog("first attack carry: nextChain=" + next + ", chainLevels=" + levels);
+            }
+            catch (Exception ex)
+            {
+                if (!_warnedChainReflection)
+                {
+                    _warnedChainReflection = true;
+                    Logger.LogWarning("[TEC] Could not inspect first attack chain state: " + ex.Message);
+                }
             }
         }
 
-        private bool TryStartPrimary(object player, bool bypassAnimatorAttackState)
+        private void PreserveFirstAttackAsPrevious()
         {
-            if (player == null || _startAttackMethod == null)
+            if (_player == null || _firstAttack == null)
+                return;
+
+            try
+            {
+                EnsureFirstAttackCarriesChain();
+                _previousAttackField.SetValue(_player, _firstAttack);
+                _timeSinceLastAttackField.SetValue(_player, 0f);
+            }
+            catch (Exception ex)
+            {
+                if (!_warnedChainReflection)
+                {
+                    _warnedChainReflection = true;
+                    Logger.LogWarning("[TEC] Could not preserve combo carry: " + ex.Message);
+                }
+            }
+        }
+
+        private bool TryStartPrimary(object player)
+        {
+            if (player == null)
                 return false;
 
             try
             {
-                var weapon = _getCurrentWeaponMethod?.Invoke(player, null);
+                var weapon = _getCurrentWeaponMethod.Invoke(player, null);
                 if (weapon == null)
                     return false;
-
-                _forceInAttackFalse = bypassAnimatorAttackState;
                 var result = _startAttackMethod.Invoke(player, new object[] { null, false });
-                return result is bool && (bool)result;
+                return result is bool b && b;
             }
-            catch (TargetInvocationException tie)
+            catch (TargetInvocationException ex)
             {
-                var inner = tie.InnerException ?? tie;
-                _log?.LogWarning("[UPC] StartAttack failed: " + inner.GetType().Name + ": " + inner.Message);
+                var inner = ex.InnerException ?? ex;
+                Logger.LogWarning("[TEC] StartAttack failed: " + inner.GetType().Name + ": " + inner.Message);
                 return false;
             }
             catch (Exception ex)
             {
-                _log?.LogWarning("[UPC] StartAttack reflection failed: " + ex.GetType().Name + ": " + ex.Message);
+                Logger.LogWarning("[TEC] StartAttack reflection failed: " + ex.Message);
                 return false;
-            }
-            finally
-            {
-                _forceInAttackFalse = false;
             }
         }
 
-        private void TrackCurrentAttack(object player)
+        private static void SetControlsPrefix(object __instance, object[] __args)
         {
-            _trackedAttack = GetCurrentAttack(player);
-            if (_trackedAttack == null)
-            {
-                _state = CycleState.Restarting;
-                _nextRestartAttempt = Time.realtimeSinceStartup + Mathf.Max(0.01f, _restartRetrySeconds.Value);
-                DebugLog("StartAttack returned true but current attack was null; retrying");
-                return;
-            }
+            _instance?.ModifyControls(__instance, __args);
+        }
 
-            _state = CycleState.WaitingForHit;
-            _stateStartedRealtime = Time.realtimeSinceStartup;
-            DebugLog("primary attack started; waiting for real hit trigger");
+        private void ModifyControls(object player, object[] args)
+        {
+            if (_state == CycleState.Idle || player == null || args == null || !ReferenceEquals(player, _player))
+                return;
+
+            if (!IsTriggerDown(out _))
+                return;
+
+            try
+            {
+                if (_state == CycleState.RaiseRealBlock)
+                {
+                    args[_attackIndex] = false;
+                    args[_attackHoldIndex] = false;
+                    args[_blockIndex] = true;
+                    args[_blockHoldIndex] = true;
+                }
+                else if (_state == CycleState.StartExtendedBridge)
+                {
+                    args[_blockIndex] = false;
+                    args[_blockHoldIndex] = false;
+                    args[_attackIndex] = false;
+                    args[_attackHoldIndex] = false;
+                }
+                else if (_state == CycleState.HoldVanillaCombo)
+                {
+                    // Crucial difference from 2.0: no more manual Stop/Start per hit.
+                    // This is literally the equivalent of holding LMB after the successful bridge.
+                    args[_blockIndex] = false;
+                    args[_blockHoldIndex] = false;
+                    args[_attackHoldIndex] = true;
+                }
+            }
+            catch { }
+        }
+
+        private static void AttackTriggerPostfix(object __instance)
+        {
+            _instance?.OnAttackTrigger(__instance);
+        }
+
+        private void OnAttackTrigger(object attack)
+        {
+            if (_state != CycleState.FirstAttack || _firstAttack == null || !ReferenceEquals(attack, _firstAttack))
+                return;
+
+            if (!IsTriggerDown(out _))
+                return;
+
+            _firstHitSeen = true;
+            DebugLog("real first OnAttackTrigger observed");
+        }
+
+        private void SetBlockingInputField(bool value)
+        {
+            if (_player == null || _blockingInputField == null)
+                return;
+            try { _blockingInputField.SetValue(_player, value); } catch { }
+        }
+
+        private void StopAutomation(string reason)
+        {
+            SetBlockingInputField(false);
+            DebugLog("Idle <- " + reason);
+            _state = CycleState.Idle;
+            _player = null;
+            _firstAttack = null;
+            _bridgeAttack = null;
+            _firstHitSeen = false;
+            _blockObservedFrame = -1;
+            _stateStarted = 0f;
+            _nextBridgeAttempt = 0f;
+        }
+
+        private object GetLocalPlayer()
+        {
+            try { return _localPlayerField.GetValue(null); }
+            catch { return null; }
         }
 
         private object GetCurrentAttack(object player)
         {
-            try { return _currentAttackField?.GetValue(player); }
+            try { return _currentAttackField.GetValue(player); }
             catch { return null; }
         }
 
         private bool IsAttackDone(object attack)
         {
-            if (attack == null)
-                return true;
-            if (_attackIsDoneMethod == null)
-                return false;
+            if (attack == null || _attackIsDoneMethod == null)
+                return attack == null;
             try
             {
-                var result = _attackIsDoneMethod.Invoke(attack, null);
-                return result is bool && (bool)result;
+                var v = _attackIsDoneMethod.Invoke(attack, null);
+                return v is bool b && b;
             }
             catch { return false; }
-        }
-
-        private static void AttackTriggerPostfix(object __instance)
-        {
-            _instance?.OnRealAttackTrigger(__instance);
-        }
-
-        private void OnRealAttackTrigger(object attack)
-        {
-            if (_state != CycleState.WaitingForHit || attack == null || !ReferenceEquals(attack, _trackedAttack))
-                return;
-            if (!IsTriggerDown(out _))
-                return;
-
-            var local = GetLocalPlayer();
-            if (local == null || !ReferenceEquals(local, _player))
-                return;
-
-            // The original OnAttackTrigger has already completed at this point: melee damage,
-            // projectile spawning, ammo/resource event work, etc. are preserved. We only delete
-            // the recovery portion after the legitimate hit event.
-            BeginGuaranteedBlockCancel(local, attack);
-        }
-
-        private void BeginGuaranteedBlockCancel(object player, object attack)
-        {
-            try
-            {
-                var current = GetCurrentAttack(player);
-                if (current == null || !ReferenceEquals(current, attack))
-                    return;
-
-                // Finish the attack object AFTER its real hit event, preserving it as previousAttack
-                // so vanilla combo-chain logic still advances normally.
-                _attackStopMethod.Invoke(attack, null);
-                _previousAttackField.SetValue(player, attack);
-                _currentAttackField.SetValue(player, null);
-                _timeSinceLastAttackField.SetValue(player, 0f);
-
-                FastForwardRecoveryAnimation(player);
-                SetSyntheticBlock(player, true);
-
-                // During this tiny visual block phase, report not-in-attack to the local engine so
-                // Valheim's own block transition is never held hostage by the old attack tag.
-                _forceInAttackFalse = true;
-                _blockStartedFrame = Time.frameCount;
-                _renderFramesWithBlock = 0;
-                _state = CycleState.ShowingBlock;
-                _stateStartedRealtime = Time.realtimeSinceStartup;
-                DebugLog("real hit fired -> recovery removed -> block shown");
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("[UPC] Could not enter synthetic block: " + ex.GetType().Name + ": " + ex.Message);
-                EndCycle(true, "block-cancel exception");
-            }
-        }
-
-        private void FastForwardRecoveryAnimation(object player)
-        {
-            if (_animatorField == null)
-                return;
-            try
-            {
-                var animator = _animatorField.GetValue(player) as Animator;
-                if (animator == null || !animator.isActiveAndEnabled)
-                    return;
-
-                var state = animator.GetCurrentAnimatorStateInfo(0);
-                if (state.fullPathHash == 0)
-                    return;
-
-                // Do not skip the attack event: this method is only called from the postfix of
-                // OnAttackTrigger. Jumping to the end here removes only recovery frames.
-                var normalized = Mathf.Clamp(_fastForwardNormalizedTime.Value, 0.80f, 0.999f);
-                animator.Play(state.fullPathHash, 0, normalized);
-            }
-            catch (Exception ex)
-            {
-                if (!_warnedFastForward)
-                {
-                    _warnedFastForward = true;
-                    Logger.LogWarning("[UPC] Animator fast-forward unavailable; block cancel will still run: " + ex.Message);
-                }
-            }
-        }
-
-        private void SetSyntheticBlock(object player, bool value)
-        {
-            try
-            {
-                _blockingInputField?.SetValue(player, value);
-                _internalBlockingStateField?.SetValue(player, value);
-
-                if (_zanimField != null && _blockingHashField != null && _zanimSetBoolMethod != null)
-                {
-                    var zanim = _zanimField.GetValue(player);
-                    var hash = _blockingHashField.GetValue(null);
-                    if (zanim != null && hash is int)
-                        _zanimSetBoolMethod.Invoke(zanim, new object[] { (int)hash, value });
-                }
-            }
-            catch (Exception ex)
-            {
-                if (!_warnedBlockVisual)
-                {
-                    _warnedBlockVisual = true;
-                    Logger.LogWarning("[UPC] Block visual reflection partially failed: " + ex.Message);
-                }
-            }
-        }
-
-        private void ClearSyntheticBlock(object player)
-        {
-            if (player != null)
-                SetSyntheticBlock(player, false);
-        }
-
-        private static void InAttackPostfix(object __instance, ref bool __result)
-        {
-            var inst = _instance;
-            if (inst == null || !inst._forceInAttackFalse || __instance == null)
-                return;
-
-            var local = inst.GetLocalPlayer();
-            if (local != null && ReferenceEquals(local, __instance))
-                __result = false;
         }
 
         private bool IsTriggerDown(out string source)
@@ -540,16 +548,14 @@ namespace Goni.DaggerPerfectCancel
             source = string.Empty;
             try
             {
-                var primary = _triggerVirtualKey != null ? _triggerVirtualKey.Value : VkXButton2;
-                if ((GetAsyncKeyState(primary) & KeyDownMask) != 0)
+                if ((GetAsyncKeyState(_triggerVirtualKey.Value) & KeyDownMask) != 0)
                 {
-                    source = "Win32 VK 0x" + primary.ToString("X2");
+                    source = "Win32 VK 0x" + _triggerVirtualKey.Value.ToString("X2");
                     return true;
                 }
-
-                if (_acceptEitherSideButton != null && _acceptEitherSideButton.Value)
+                if (_acceptEitherSideButton.Value)
                 {
-                    var alternate = primary == VkXButton1 ? VkXButton2 : VkXButton1;
+                    var alternate = _triggerVirtualKey.Value == VkXButton1 ? VkXButton2 : VkXButton1;
                     if ((GetAsyncKeyState(alternate) & KeyDownMask) != 0)
                     {
                         source = "Win32 alternate VK 0x" + alternate.ToString("X2");
@@ -561,26 +567,52 @@ namespace Goni.DaggerPerfectCancel
             return false;
         }
 
-        private void EndCycle(bool restoreBlock, string reason)
+        private static bool InvokeBool(MethodInfo method, object obj)
         {
-            if (restoreBlock && _player != null)
-                ClearSyntheticBlock(_player);
-
-            _forceInAttackFalse = false;
-            _state = CycleState.Idle;
-            _player = null;
-            _trackedAttack = null;
-            _renderFramesWithBlock = 0;
-            _blockStartedFrame = 0;
-            _stateStartedRealtime = 0f;
-            _nextRestartAttempt = 0f;
-            DebugLog("cycle ended: " + reason);
+            if (method == null || obj == null)
+                return false;
+            try
+            {
+                var v = method.Invoke(obj, null);
+                return v is bool b && b;
+            }
+            catch { return false; }
         }
+
+        private static FieldInfo FindField(Type type, string name)
+        {
+            for (var t = type; t != null; t = t.BaseType)
+            {
+                var f = t.GetField(name, BindingFlags.Instance | BindingFlags.Static |
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                if (f != null) return f;
+            }
+            return null;
+        }
+
+        private static bool HasControlLayout(ParameterInfo[] p)
+        {
+            var names = new HashSet<string>(p.Select(x => x.Name ?? string.Empty), StringComparer.OrdinalIgnoreCase);
+            if (names.Contains("attack") && names.Contains("attackHold") && names.Contains("block") && names.Contains("blockHold"))
+                return true;
+            return p.Length >= 7 && p[1].ParameterType == typeof(bool) && p[2].ParameterType == typeof(bool) &&
+                   p[5].ParameterType == typeof(bool) && p[6].ParameterType == typeof(bool);
+        }
+
+        private static int FindParameter(ParameterInfo[] p, string name, int fallback)
+        {
+            for (var i = 0; i < p.Length; ++i)
+                if (string.Equals(p[i].Name, name, StringComparison.OrdinalIgnoreCase)) return i;
+            return fallback;
+        }
+
+        private bool ValidIndex(int i) => i >= 0 && _setControlsMethod != null && i < _setControlsMethod.GetParameters().Length;
+        private static string Found(MemberInfo m) => m != null ? "found" : "missing";
 
         private void DebugLog(string message)
         {
             if (_verbose != null && _verbose.Value)
-                Logger.LogInfo("[UPC] " + message);
+                Logger.LogInfo("[TEC] " + message);
         }
     }
 }
