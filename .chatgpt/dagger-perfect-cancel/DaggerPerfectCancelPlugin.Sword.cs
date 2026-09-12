@@ -11,12 +11,12 @@ namespace Goni.DaggerPerfectCancel
     public sealed partial class DaggerPerfectCancelPlugin
     {
         private Harmony _swordHarmony;
-        private bool _swordReady, _startingSkillAttack, _startingSkillSlash, _allowSkillChain;
+        private bool _swordReady, _swordFaulted, _startingSkillAttack, _startingSkillSlash, _allowSkillChain;
         private ConfigEntry<bool> _swordEnabled;
         private ConfigEntry<float> _swordTimeout, _blockPoseSeconds;
         private readonly SwordSkillSequence _skill = new SwordSkillSequence();
         private FieldInfo _currentAttack, _animatorField, _animEventField, _queuedPrimary, _queuedSecondary;
-        private MethodInfo _getCurrentBlocker;
+        private readonly List<FieldInfo> _secondaryProfileFields = new List<FieldInfo>();
         private Player _skillOwner;
         private ItemDrop.ItemData _skillWeapon;
         private Attack _skillAttack, _preparedAttack;
@@ -43,8 +43,16 @@ namespace Goni.DaggerPerfectCancel
                 _animEventField = RequiredField(typeof(Character), "m_animEvent", typeof(CharacterAnimEvent));
                 _queuedPrimary = RequiredField(typeof(Player), "m_queuedAttackTimer", typeof(float));
                 _queuedSecondary = RequiredField(typeof(Player), "m_queuedSecondAttackTimer", typeof(float));
-                _getCurrentBlocker = AccessTools.Method(typeof(Humanoid), "GetCurrentBlocker", Type.EmptyTypes);
-                if (_getCurrentBlocker == null) throw new MissingMethodException("Humanoid.GetCurrentBlocker");
+                // Optional modifiers vary across Valheim releases. Copy only
+                // fields present in the running game, without static IL links
+                // to newer health-based attack modifiers.
+                foreach (var name in new[] { "m_damageMultiplierPerMissingHP", "m_damageMultiplierByTotalHealthMissing",
+                    "m_forceMultiplier", "m_staggerMultiplier", "m_lowerDamagePerHit" })
+                {
+                    var field = AccessTools.Field(typeof(Attack), name);
+                    if (field != null && (field.FieldType == typeof(float) || field.FieldType == typeof(bool)))
+                        _secondaryProfileFields.Add(field);
+                }
                 _swordHarmony = new Harmony(PluginGuid + ".swordskill");
                 PatchSkill(typeof(Player), "PlayerAttackInput", nameof(SkillAttackInputPrefix), null);
                 PatchSkill(typeof(Humanoid), "StartAttack", nameof(SkillStartGate), null);
@@ -56,9 +64,8 @@ namespace Goni.DaggerPerfectCancel
                     if (_verbose.Value || stage == SwordSkillSequence.Stage.WaitRelease)
                         Logger.LogInfo("[SwordSkill #" + _skillNumber + "] " + stage + ": " + reason);
                 };
-                SetupSwordGuard();
                 _swordReady = true;
-                Logger.LogInfo("[SwordSkill] Ready: Mouse5 = primary -> visible block -> three secondary-damage sword slashes. F9 toggles visible sword guard.");
+                Logger.LogInfo("[SwordSkill] Ready: Mouse5 = primary -> visible block -> three secondary-damage sword slashes. Auto guard removed.");
             }
             catch (Exception ex)
             {
@@ -88,7 +95,7 @@ namespace Goni.DaggerPerfectCancel
             // Returning true means this press belongs to the sword feature, even
             // if it is rejected. Never silently run the obsolete sword macro.
             if (_skill.Current != SwordSkillSequence.Stage.Idle || !CanUsePlayer(player)
-                || player.InAttack() || (player.IsBlocking() && !_guardApplied)) return true;
+                || player.InAttack() || player.IsBlocking()) return true;
             if (!weapon.HaveSecondaryAttack() || weapon.m_shared.m_attack == null
                 || weapon.m_shared.m_secondaryAttack == null
                 || !IsMelee(weapon.m_shared.m_attack) || !IsMelee(weapon.m_shared.m_secondaryAttack))
@@ -109,7 +116,6 @@ namespace Goni.DaggerPerfectCancel
                 if (!Array.Exists(parameters, p => p.type == AnimatorControllerParameterType.Trigger && p.name == trigger))
                 { Logger.LogWarning("[SwordSkill] Missing animation trigger: " + trigger); return true; }
             }
-            StopSwordGuard(false);
             _skillOwner = player; _skillWeapon = weapon; _skillAnimator = animator; _skillAnimEvent = animEvent;
             _skillAttack = _preparedAttack = null; _slashTriggers = triggers;
             _skill.Timeout = Mathf.Clamp(_swordTimeout.Value, 1f, 30f);
@@ -172,7 +178,7 @@ namespace Goni.DaggerPerfectCancel
                 _skillAttacks.Add(actual, new SkillAttackStamp());
                 _skill.Accepted(now);
             }
-            catch (Exception ex) { CancelSwordSkill("attack startup failed: " + ex.Message); }
+            catch (Exception ex) { DisableSwordSkill(ex); }
             finally { _startingSkillAttack = _startingSkillSlash = _allowSkillChain = false; }
         }
         private void LogBlockClips()
@@ -214,7 +220,8 @@ namespace Goni.DaggerPerfectCancel
         {
             var self = _instance;
             if (self == null || !self._swordReady || !self._skill.Running || __instance != self._skillOwner) return true;
-            self.ClearSkillQueues(__instance);
+            try { self.ClearSkillQueues(__instance); }
+            catch (Exception ex) { self.DisableSwordSkill(ex); }
             return false; // The skill owns attack startup; no parallel input queue.
         }
         private static bool SkillStartGate(Humanoid __instance, ref bool __result)
@@ -245,14 +252,9 @@ namespace Goni.DaggerPerfectCancel
             __instance.m_attackChainLevels = 0; // Explicit 0/1/2 animation triggers; no vanilla final-hit 2x bonus.
             __instance.m_attackRandomAnimations = 1;
             __instance.m_damageMultiplier = secondary.m_damageMultiplier;
-            __instance.m_damageMultiplierPerMissingHP = secondary.m_damageMultiplierPerMissingHP;
-            __instance.m_damageMultiplierByTotalHealthMissing = secondary.m_damageMultiplierByTotalHealthMissing;
-            __instance.m_forceMultiplier = secondary.m_forceMultiplier;
-            __instance.m_staggerMultiplier = secondary.m_staggerMultiplier;
-            __instance.m_lowerDamagePerHit = secondary.m_lowerDamagePerHit;
-            __instance.m_lastChainDamageMultiplier = 1f;
+            foreach (var field in self._secondaryProfileFields)
+                field.SetValue(__instance, field.GetValue(secondary));
             __instance.m_attackStamina = 0f;
-            __instance.m_staminaReturnPerMissingHP = 0f;
         }
         private static bool SkillMeleePrefix(Attack __instance)
         {
@@ -260,7 +262,11 @@ namespace Goni.DaggerPerfectCancel
             if (self == null || !self._skillAttacks.TryGetValue(__instance, out var stamp)) return true;
             if (stamp.Consumed || stamp.Cancelled || !self._skill.Running
                 || !ReferenceEquals(__instance, self._skillAttack)) return false;
-            if (!self.SkillOwnerValid()) { self.CancelSwordSkill("interrupted before melee event"); return false; }
+            try
+            {
+                if (!self.SkillOwnerValid()) { self.CancelSwordSkill("interrupted before melee event"); return false; }
+            }
+            catch (Exception ex) { self.DisableSwordSkill(ex); return false; }
             // Several targets in a swing are processed by vanilla in ONE call.
             // A duplicate animation event must not deal a fourth hit.
             stamp.Consumed = true;
@@ -292,21 +298,48 @@ namespace Goni.DaggerPerfectCancel
             }
             finally { _releasing = old; }
         }
+        private void DisableSwordSkill(Exception error)
+        {
+            if (_swordFaulted) return;
+            // Latch BEFORE cleanup/logging; failed cleanup cannot re-enter the
+            // same broken path on every subsequent Update/SetControls call.
+            _swordFaulted = true;
+            _swordReady = false;
+            try { CancelSwordSkill("runtime fault; disabled until restart"); }
+            catch { ClearSwordReferences(); }
+            Logger.LogError("[SwordSkill] Disabled for this session after " + error.GetType().Name
+                + ": " + error.Message + ". No automatic retry. " + error.StackTrace);
+        }
         private void CancelSwordSkill(string reason)
         {
             if (!_skill.Running) return;
             if (_skillAttack != null && _skillAttacks.TryGetValue(_skillAttack, out var stamp)) stamp.Cancelled = true;
-            if (_skillAttack != null && _skillOwner != null
-                && ReferenceEquals(_currentAttack.GetValue(_skillOwner), _skillAttack)) _skillAttack.Abort();
+            // Stop state-machine ownership first, even if an engine API below is unavailable.
             _skill.Cancel(Time.time, reason);
-            ReleaseSwordSkill();
+            try
+            {
+                if (_skillAttack != null && _skillOwner != null
+                    && ReferenceEquals(_currentAttack.GetValue(_skillOwner), _skillAttack)) _skillAttack.Abort();
+            }
+            finally { ReleaseSwordSkill(); }
         }
         private void ReleaseSwordSkill()
         {
-            if (_skillOwner != null && _skillOwner == Player.m_localPlayer)
-            { ClearSkillQueues(_skillOwner); SetCombatNeutral(_skillOwner); }
+            try
+            {
+                if (_skillOwner != null && _skillOwner == Player.m_localPlayer)
+                {
+                    try { ClearSkillQueues(_skillOwner); }
+                    finally { SetCombatNeutral(_skillOwner); }
+                }
+            }
+            finally { ClearSwordReferences(); }
+        }
+        private void ClearSwordReferences()
+        {
             _skillAttack = _preparedAttack = null;
             _skillOwner = null; _skillWeapon = null; _skillAnimator = null; _skillAnimEvent = null;
+            _startingSkillAttack = _startingSkillSlash = _allowSkillChain = false;
         }
     }
 }

@@ -7,6 +7,7 @@ on:
       - chatgpt/valheim-localhud-input-fix-20260911
       - chatgpt/valheim-sword-followup-20260911
       - chatgpt/valheim-sword-skill-20260912
+      - chatgpt/valheim-sword-only-20260912
   workflow_dispatch:
 
 permissions:
@@ -35,7 +36,7 @@ jobs:
 
       - name: Verify state and input sequencing
         shell: pwsh
-        run: dotnet run --project .chatgpt/block-cancel-tests/BlockCancel.Tests.csproj -c Release
+        run: dotnet run --project .chatgpt/block-cancel-tests/BlockCancel.Tests.csproj -c Release -- .chatgpt/dagger-perfect-cancel/bin/Release/net48/Goni.DaggerPerfectCancel.dll
 
       - name: Package
         shell: pwsh
@@ -49,6 +50,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Goni-SwordSkill-3.3.0-VisibleGuard
+          name: Goni-SwordSkill-3.3.1-NoGuard
           path: artifact/*
           if-no-files-found: error

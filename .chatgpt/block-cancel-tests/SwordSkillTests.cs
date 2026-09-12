@@ -102,19 +102,6 @@ static class SwordSkillTests
             Check(!s.Running && !s.WantsStart && !s.WantsBlock, "cancel releases attack and guard ownership");
             Check(!s.MeleeEvent(), "late callback cannot resurrect cancelled sequence");
         }
-        var guard = new SwordGuardPolicy();
-        Check(!guard.Step(0, true, false), "no threat no auto block");
-        Check(guard.Step(.1, true, true), "threat raises guard");
-        Check(guard.Step(.15, true, false), "guard motion kept visible despite brief threat");
-        Check(!guard.Step(.4, true, false), "guard does not stick");
-        Check(guard.Step(.5, true, true), "can guard again");
-        Check(!guard.Step(.51, false, true), "manual attack/dodge/UI takes priority");
-        Check(SwordGuardPolicy.IsThreat(3, 0, 1, 1, 6, true), "frontal incoming melee");
-        Check(!SwordGuardPolicy.IsThreat(3, 0, -1, 1, 6, true), "no auto block behind player");
-        Check(!SwordGuardPolicy.IsThreat(3, 0, 1, -1, 6, true), "enemy attacking away ignored");
-        Check(!SwordGuardPolicy.IsThreat(10, 0, 1, 1, 6, true), "distant attacker ignored");
-        Check(!SwordGuardPolicy.IsThreat(3, 4, 1, 1, 6, true), "different floor ignored");
-        Check(!SwordGuardPolicy.IsThreat(3, 0, 1, 1, 6, false), "ranged startup is not melee threat");
-        Console.WriteLine($"PASS: {checks} sword skill / visible guard assertions. Gameplay animation appearance, network behavior and mod compatibility still require Valheim.");
+        Console.WriteLine($"PASS: {checks} sword skill assertions. Gameplay animation appearance, network behavior and mod compatibility still require Valheim.");
     }
 }
