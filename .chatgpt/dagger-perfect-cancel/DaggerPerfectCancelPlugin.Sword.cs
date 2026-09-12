@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using BepInEx.Configuration;
 using HarmonyLib;
 using UnityEngine;
@@ -24,6 +25,10 @@ namespace Goni.DaggerPerfectCancel
         private string[] _slashTriggers;
         private int _skillNumber;
         private readonly List<AnimatorClipInfo> _blockClips = new List<AnimatorClipInfo>(8);
+        private sealed class SkillAttackStamp { internal bool Consumed, Cancelled; }
+        // Weak keys retain deduplication after completion/cancellation without
+        // retaining attacks/players over a long play session.
+        private readonly ConditionalWeakTable<Attack, SkillAttackStamp> _skillAttacks = new ConditionalWeakTable<Attack, SkillAttackStamp>();
 
         private void TrySetupSwordSkill()
         {
@@ -164,6 +169,7 @@ namespace Goni.DaggerPerfectCancel
                 if (actual == null || !ReferenceEquals(actual, _preparedAttack))
                 { CancelSwordSkill("attack startup was replaced by another patch"); return; }
                 _skillAttack = actual;
+                _skillAttacks.Add(actual, new SkillAttackStamp());
                 _skill.Accepted(now);
             }
             catch (Exception ex) { CancelSwordSkill("attack startup failed: " + ex.Message); }
@@ -251,11 +257,14 @@ namespace Goni.DaggerPerfectCancel
         private static bool SkillMeleePrefix(Attack __instance)
         {
             var self = _instance;
-            if (self == null || !self._skill.Running || !ReferenceEquals(__instance, self._skillAttack)) return true;
+            if (self == null || !self._skillAttacks.TryGetValue(__instance, out var stamp)) return true;
+            if (stamp.Consumed || stamp.Cancelled || !self._skill.Running
+                || !ReferenceEquals(__instance, self._skillAttack)) return false;
             if (!self.SkillOwnerValid()) { self.CancelSwordSkill("interrupted before melee event"); return false; }
             // Several targets in a swing are processed by vanilla in ONE call.
             // A duplicate animation event must not deal a fourth hit.
-            return !self._skill.EventSeen;
+            stamp.Consumed = true;
+            return true;
         }
         private static void SkillMeleePostfix(Attack __instance, bool __runOriginal)
         {
@@ -286,6 +295,7 @@ namespace Goni.DaggerPerfectCancel
         private void CancelSwordSkill(string reason)
         {
             if (!_skill.Running) return;
+            if (_skillAttack != null && _skillAttacks.TryGetValue(_skillAttack, out var stamp)) stamp.Cancelled = true;
             if (_skillAttack != null && _skillOwner != null
                 && ReferenceEquals(_currentAttack.GetValue(_skillOwner), _skillAttack)) _skillAttack.Abort();
             _skill.Cancel(Time.time, reason);

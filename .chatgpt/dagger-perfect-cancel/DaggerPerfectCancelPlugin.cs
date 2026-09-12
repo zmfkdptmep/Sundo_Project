@@ -155,7 +155,7 @@ namespace Goni.DaggerPerfectCancel
             ref bool block, ref bool blockHold, bool jump, bool dodge)
         {
             var self = _instance;
-            if (self == null || !self._ready || self._releasing || __instance != Player.m_localPlayer) return;
+            if (self == null || !self._ready || !self.isActiveAndEnabled || self._releasing || __instance != Player.m_localPlayer) return;
             self._rawMove = movedir;
             self._rawRun = run;
             self._lastControlTime = Time.realtimeSinceStartup;
