@@ -8,5 +8,6 @@
   <ItemGroup>
     <Compile Include="../dagger-perfect-cancel/BlockCancelSequence.cs" Link="BlockCancelSequence.cs" />
     <Compile Include="../dagger-perfect-cancel/SwordSkillSequence.cs" Link="SwordSkillSequence.cs" />
+    <Compile Include="../dagger-perfect-cancel/AnimationSpeedLease.cs" Link="AnimationSpeedLease.cs" />
   </ItemGroup>
 </Project>

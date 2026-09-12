@@ -64,6 +64,7 @@ namespace Goni.DaggerPerfectCancel
                     if (_verbose.Value || stage == SwordSkillSequence.Stage.WaitRelease)
                         Logger.LogInfo("[SwordSkill #" + _skillNumber + "] " + stage + ": " + reason);
                 };
+                SetupSwordTempo();
                 _swordReady = true;
                 Logger.LogInfo("[SwordSkill] Ready: Mouse5 = primary -> visible block -> three secondary-damage sword slashes. Auto guard removed.");
             }
@@ -119,15 +120,21 @@ namespace Goni.DaggerPerfectCancel
             _skillOwner = player; _skillWeapon = weapon; _skillAnimator = animator; _skillAnimEvent = animEvent;
             _skillAttack = _preparedAttack = null; _slashTriggers = triggers;
             _skill.Timeout = Mathf.Clamp(_swordTimeout.Value, 1f, 30f);
-            _skill.BlockPoseSeconds = Mathf.Clamp(_blockPoseSeconds.Value, .10f, 1f);
+            _skill.BlockPoseSeconds = _tempoReady && _tempoEnabled.Value
+                ? Mathf.Clamp(_tempoBlockSeconds.Value, .06f, .30f)
+                : Mathf.Clamp(_blockPoseSeconds.Value, .10f, 1f);
             ++_skillNumber;
             _lastControlTime = Time.realtimeSinceStartup;
             ClearSkillQueues(player);
             SetCombatNeutral(player);
+            BeginSwordReport();
             _skill.Begin(now);
             Logger.LogInfo("[SwordSkill #" + _skillNumber + "] weapon=" + weapon.m_shared.m_name
                 + "; secondaryDamageMultiplier=" + weapon.m_shared.m_secondaryAttack.m_damageMultiplier
-                + "; slashAnimations=" + string.Join(",", triggers) + "; slashStamina=0");
+                + "; slashAnimations=" + string.Join(",", triggers) + "; slashStamina=0"
+                + "; tempo=" + (_tempoReady && _tempoEnabled.Value ? "on" : "off")
+                + "; slashSpeed=" + (_tempoReady && _tempoEnabled.Value ? Mathf.Clamp(_slashSpeed.Value, 1f, 3.5f) : 1f)
+                + "; recoverySpeed=" + (_tempoReady && _tempoEnabled.Value ? Mathf.Clamp(_recoverySpeed.Value, 1f, 6f) : 1f));
             return true;
         }
         private static bool IsSword(ItemDrop.ItemData weapon) => weapon?.m_shared != null && weapon.m_shared.m_skillType == Skills.SkillType.Swords;
@@ -145,6 +152,7 @@ namespace Goni.DaggerPerfectCancel
             if (!SkillOwnerValid()) { CancelSwordSkill("player/UI/focus/weapon interruption"); return; }
             if (Time.realtimeSinceStartup - _lastControlTime > 1f)
             { CancelSwordSkill("control updates stopped"); return; }
+            ApplySwordTempo();
             bool inAttack = _skillOwner.InAttack();
             bool currentMatches = ReferenceEquals(_currentAttack.GetValue(_skillOwner), _skillAttack);
             if (_skillAttack != null && !currentMatches && inAttack)
@@ -176,7 +184,9 @@ namespace Goni.DaggerPerfectCancel
                 { CancelSwordSkill("attack startup was replaced by another patch"); return; }
                 _skillAttack = actual;
                 _skillAttacks.Add(actual, new SkillAttackStamp());
+                if (_startingSkillSlash && _skill.SlashesStarted == 0) _firstSlashAt = Time.realtimeSinceStartup;
                 _skill.Accepted(now);
+                ApplySwordTempo();
             }
             catch (Exception ex) { DisableSwordSkill(ex); }
             finally { _startingSkillAttack = _startingSkillSlash = _allowSkillChain = false; }
@@ -276,7 +286,9 @@ namespace Goni.DaggerPerfectCancel
         {
             var self = _instance;
             if (!__runOriginal || self == null || !self._skill.Running || !ReferenceEquals(__instance, self._skillAttack)) return;
-            if (self._skill.MeleeEvent() && self._verbose.Value)
+            if (!self._skill.MeleeEvent()) return;
+            self.ObserveSwordMelee(__instance);
+            if (self._verbose.Value)
                 self.Logger.LogInfo("[SwordSkill #" + self._skillNumber + "] melee: opening=" + self._skill.OpeningEvents
                     + "; slashes=" + self._skill.SlashesCompleted + "/3; damageMultiplier=" + __instance.m_damageMultiplier
                     + "; attackStamina=" + __instance.m_attackStamina);
@@ -333,7 +345,15 @@ namespace Goni.DaggerPerfectCancel
                     finally { SetCombatNeutral(_skillOwner); }
                 }
             }
-            finally { ClearSwordReferences(); }
+            finally
+            {
+                try { ReportSwordSkill(); }
+                finally
+                {
+                    try { RestoreSwordTempo(); }
+                    finally { ClearSwordReferences(); }
+                }
+            }
         }
         private void ClearSwordReferences()
         {

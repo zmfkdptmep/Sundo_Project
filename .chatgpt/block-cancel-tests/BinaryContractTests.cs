@@ -8,7 +8,7 @@ static class BinaryContractTests
         using var stream = File.OpenRead(path);
         using var pe = new PEReader(stream);
         var metadata = pe.GetMetadataReader();
-        if (metadata.GetAssemblyDefinition().Version != new Version(3, 3, 1, 0))
+        if (metadata.GetAssemblyDefinition().Version != new Version(3, 4, 0, 0))
             throw new Exception("Wrong plugin version in binary contract test.");
         foreach (var handle in metadata.MemberReferences)
         {
@@ -35,7 +35,7 @@ static class BinaryContractTests
                 throw new Exception("Automatic guard code is still compiled: " + name);
         }
         foreach (string name in new[] { "TryBeginSwordSkill", "TickSwordSkill", "SkillPrepareAttack", "HasBlockClip",
-            "DisableSwordSkill", "ClearSwordReferences", "SkillMeleePrefix", "CancelSwordSkill" })
+            "DisableSwordSkill", "ClearSwordReferences", "SkillMeleePrefix", "CancelSwordSkill", "ApplySwordTempo", "RestoreSwordTempo", "SkillSpeedEvent", "SkillFreezeFrame", "ReportSwordSkill" })
             if (!methods.Contains(name)) throw new Exception("Missing sword integration method: " + name);
         Console.WriteLine("PASS: shipped DLL has no Character.Message, MessageHud, auto-guard logic or static optional health-modifier field dependencies; sword integration retained.");
     }

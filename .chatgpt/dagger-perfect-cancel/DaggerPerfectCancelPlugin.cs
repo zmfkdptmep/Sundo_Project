@@ -14,7 +14,7 @@ namespace Goni.DaggerPerfectCancel
     {
         public const string PluginGuid = "goni.valheim.daggerperfectcancel";
         public const string PluginName = "Goni State Driven Block Cancel";
-        public const string PluginVersion = "3.3.1";
+        public const string PluginVersion = "3.4.0";
         private static DaggerPerfectCancelPlugin _instance;
         private Harmony _harmony;
         private readonly BlockCancelSequence _sequence = new BlockCancelSequence();
@@ -253,6 +253,7 @@ namespace Goni.DaggerPerfectCancel
             ReleaseFeatures("plugin unloaded");
             _harmony?.UnpatchSelf();
             _swordHarmony?.UnpatchSelf();
+            _tempoHarmony?.UnpatchSelf();
             _ready = false;
             if (_instance == this) _instance = null;
         }
