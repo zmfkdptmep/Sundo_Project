@@ -47,7 +47,17 @@ static class BinaryContractTests
                     if(token.Kind==HandleKind.MemberReference)
                     {
                         var r=md.GetMemberReference((MemberReferenceHandle)token); var member=md.GetString(r.Name);
-                        if(op==OpCodes.Stfld || op==OpCodes.Stsfld)
+                        // Harmony patch priority is plugin setup metadata, not
+                        // game state. Keep the exception exact and reject every
+                        // other external field store.
+                        bool patchPriority = false;
+                        if(r.Parent.Kind==HandleKind.TypeReference)
+                        {
+                            var owner=md.GetTypeReference((TypeReferenceHandle)r.Parent);
+                            patchPriority=md.GetString(owner.Namespace)=="HarmonyLib"
+                                && md.GetString(owner.Name)=="HarmonyMethod" && member=="priority";
+                        }
+                        if((op==OpCodes.Stfld || op==OpCodes.Stsfld) && !patchPriority)
                             throw new Exception("External state field write in input-only DLL: "+name+" -> "+member);
                         if(member=="SetValue" && name!="ClearSwordQueues")
                             throw new Exception("Reflection write outside two input queue cleanups: "+name);
@@ -59,6 +69,6 @@ static class BinaryContractTests
         foreach(var needed in new[]{"TryBeginSwordInput","SwordConsumerPrefix","SwordConsumerPostfix","SwordAttackAccepted",
             "SwordBlockProcessed","SwordMeleeAfter","DisableSwordInput","ReleaseSwordInput"})
             if(!methods.Contains(needed)) throw new Exception("Missing native input method "+needed);
-        Console.WriteLine("PASS: shipped DLL is input-only: no direct attack creation/start, animation/speed/chain/damage mutation, external field stores, guard or Message dependency. Reflection writes confined to input queue cleanup.");
+        Console.WriteLine("PASS: shipped DLL is input-only: no direct attack creation/start, animation/speed/chain/damage mutation, game field stores, guard or Message dependency. Reflection writes confined to input queue cleanup; Harmony patch priority metadata allowed.");
     }
 }
