@@ -1,42 +1,64 @@
 using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
+using System.Reflection.Emit;
 
 static class BinaryContractTests
 {
     internal static void Run(string path)
     {
-        using var stream = File.OpenRead(path);
-        using var pe = new PEReader(stream);
-        var metadata = pe.GetMetadataReader();
-        if (metadata.GetAssemblyDefinition().Version != new Version(3, 4, 0, 0))
-            throw new Exception("Wrong plugin version in binary contract test.");
-        foreach (var handle in metadata.MemberReferences)
+        using var stream=File.OpenRead(path);
+        using var pe=new PEReader(stream);
+        var md=pe.GetMetadataReader();
+        if(md.GetAssemblyDefinition().Version!=new Version(3,5,0,0)) throw new Exception("Wrong DLL version");
+        var prohibited=new HashSet<string>{"Message","GetAllCharacters","IsEnemy","set_speed","set_timeScale",
+            "SetTrigger","CrossFade","Play","Clone","StartAttack","Abort","ResetChain","ModifyDamage","HaveQueuedChain"};
+        foreach(var h in md.MemberReferences)
         {
-            string name = metadata.GetString(metadata.GetMemberReference(handle).Name);
-            // Regression for the user's 1,423 repeated MissingMethodException
-            // messages. Verify the SHIPPED DLL, not only source text or config.
-            if (name == "Message" || name == "GetAllCharacters" || name == "IsEnemy")
-                throw new Exception("Removed guard/message dependency still present in DLL: " + name);
-            if (name == "m_damageMultiplierByTotalHealthMissing" || name == "m_damageMultiplierPerMissingHP")
-                throw new Exception("Version-sensitive optional attack field is statically linked: " + name);
+            var name=md.GetString(md.GetMemberReference(h).Name);
+            if(prohibited.Contains(name)) throw new Exception("Input-only DLL has a prohibited engine call: "+name);
         }
-        foreach (var handle in metadata.TypeReferences)
+        var opcodes=typeof(OpCodes).GetFields().Where(f=>f.FieldType==typeof(OpCode)).Select(f=>(OpCode)f.GetValue(null))
+            .ToDictionary(o=>unchecked((ushort)o.Value));
+        var methods=new HashSet<string>();
+        foreach(var h in md.MethodDefinitions)
         {
-            string name = metadata.GetString(metadata.GetTypeReference(handle).Name);
-            if (name == "MessageHud" || name == "MessageType")
-                throw new Exception("Removed message API type still present: " + name);
+            var method=md.GetMethodDefinition(h); var name=md.GetString(method.Name); methods.Add(name);
+            if(name.Contains("SwordGuard") || name.Contains("SwordTempo") || name=="SkillPrepareAttack")
+                throw new Exception("Removed custom skill remains in binary: "+name);
+            if(method.RelativeVirtualAddress==0) continue;
+            var il=pe.GetMethodBody(method.RelativeVirtualAddress).GetILBytes();
+            for(int i=0;i<il.Length;)
+            {
+                ushort code=il[i++]; if(code==0xfe) code=(ushort)(0xfe00|il[i++]);
+                var op=opcodes[code]; int size;
+                switch(op.OperandType)
+                {
+                    case OperandType.InlineNone:size=0;break;
+                    case OperandType.ShortInlineI:case OperandType.ShortInlineBrTarget:case OperandType.ShortInlineVar:size=1;break;
+                    case OperandType.InlineVar:size=2;break;
+                    case OperandType.InlineI8:case OperandType.InlineR:size=8;break;
+                    case OperandType.InlineSwitch:size=4+4*BitConverter.ToInt32(il,i);break;
+                    default:size=4;break;
+                }
+                if(op.OperandType==OperandType.InlineField || op.OperandType==OperandType.InlineMethod)
+                {
+                    var token=MetadataTokens.EntityHandle(BitConverter.ToInt32(il,i));
+                    if(token.Kind==HandleKind.MemberReference)
+                    {
+                        var r=md.GetMemberReference((MemberReferenceHandle)token); var member=md.GetString(r.Name);
+                        if(op==OpCodes.Stfld || op==OpCodes.Stsfld)
+                            throw new Exception("External state field write in input-only DLL: "+name+" -> "+member);
+                        if(member=="SetValue" && name!="ClearSwordQueues")
+                            throw new Exception("Reflection write outside two input queue cleanups: "+name);
+                    }
+                }
+                i+=size;
+            }
         }
-        var methods = new HashSet<string>();
-        foreach (var handle in metadata.MethodDefinitions)
-        {
-            string name = metadata.GetString(metadata.GetMethodDefinition(handle).Name);
-            methods.Add(name);
-            if (name.Contains("SwordGuard") || name == "TickGuardHotkey" || name == "HasMeleeThreat")
-                throw new Exception("Automatic guard code is still compiled: " + name);
-        }
-        foreach (string name in new[] { "TryBeginSwordSkill", "TickSwordSkill", "SkillPrepareAttack", "HasBlockClip",
-            "DisableSwordSkill", "ClearSwordReferences", "SkillMeleePrefix", "CancelSwordSkill", "ApplySwordTempo", "RestoreSwordTempo", "SkillSpeedEvent", "SkillFreezeFrame", "ReportSwordSkill" })
-            if (!methods.Contains(name)) throw new Exception("Missing sword integration method: " + name);
-        Console.WriteLine("PASS: shipped DLL has no Character.Message, MessageHud, auto-guard logic or static optional health-modifier field dependencies; sword integration retained.");
+        foreach(var needed in new[]{"TryBeginSwordInput","SwordConsumerPrefix","SwordConsumerPostfix","SwordAttackAccepted",
+            "SwordBlockProcessed","SwordMeleeAfter","DisableSwordInput","ReleaseSwordInput"})
+            if(!methods.Contains(needed)) throw new Exception("Missing native input method "+needed);
+        Console.WriteLine("PASS: shipped DLL is input-only: no direct attack creation/start, animation/speed/chain/damage mutation, external field stores, guard or Message dependency. Reflection writes confined to input queue cleanup.");
     }
 }

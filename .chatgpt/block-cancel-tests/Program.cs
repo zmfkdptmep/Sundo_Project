@@ -89,8 +89,7 @@ static class Program
         Check(departed.Begin(.23), "player replacement does not leave state machine stuck");
         Console.WriteLine($"PASS: {_checks} state/input assertions; 63 swing-duration scenarios. This is not a Valheim gameplay test.");
         SwordTests.Run();
-        SwordSkillTests.Run();
-        SwordTempoTests.Run();
+        SwordInputTests.Run();
         if (args.Length == 1) BinaryContractTests.Run(args[0]);
     }
 }

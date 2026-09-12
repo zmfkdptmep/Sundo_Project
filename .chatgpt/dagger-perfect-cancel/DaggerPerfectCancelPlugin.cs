@@ -14,7 +14,7 @@ namespace Goni.DaggerPerfectCancel
     {
         public const string PluginGuid = "goni.valheim.daggerperfectcancel";
         public const string PluginName = "Goni State Driven Block Cancel";
-        public const string PluginVersion = "3.4.0";
+        public const string PluginVersion = "3.5.0";
         private static DaggerPerfectCancelPlugin _instance;
         private Harmony _harmony;
         private readonly BlockCancelSequence _sequence = new BlockCancelSequence();
@@ -76,8 +76,8 @@ namespace Goni.DaggerPerfectCancel
                 _harmony.Patch(attackConsumer, postfix: new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), nameof(AttackInputPostfix)));
                 _harmony.Patch(blockUpdate, postfix: new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), nameof(BlockUpdatePostfix)));
                 _ready = true;
-                TrySetupSwordSkill();
-                Logger.LogInfo(PluginName + " " + PluginVersion + " loaded. Mouse5; F12 cancel. Legacy input block cancel plus sword triple slash. Auto guard removed.");
+                TrySetupSwordInput();
+                Logger.LogInfo(PluginName + " " + PluginVersion + " loaded. Mouse5; F12 cancel. Sword native input sequence: primary -> block -> ONE primary -> primary+secondary hold. No custom attacks or speed changes.");
                 Logger.LogInfo("[SDBC] Game assembly: " + typeof(Player).Assembly.GetName().Version + "; Unity " + Application.unityVersion);
             }
             catch (Exception ex)
@@ -97,17 +97,17 @@ namespace Goni.DaggerPerfectCancel
             _sequence.Rearm(down, now);
             if (ReadKey(0x7B))
             {
-                try { CancelSwordSkill("F12 emergency cancel"); }
-                catch (Exception ex) { DisableSwordSkill(ex); }
+                try { CancelSwordInput("F12 emergency cancel"); }
+                catch (Exception ex) { DisableSwordInput(ex); }
                 if (_sequence.Running) CancelAndRelease("F12 emergency release");
                 return;
             }
             if (_swordReady)
             {
-                try { TickSwordSkill(down); }
-                catch (Exception ex) { DisableSwordSkill(ex); }
+                try { TickSwordInput(down); }
+                catch (Exception ex) { DisableSwordInput(ex); }
             }
-            if (_skill.Running) return;
+            if (_swordInput.Running) return;
             if (_sequence.Running)
             {
                 if (ReadKey(0x7B)) { CancelAndRelease("F12 emergency release"); return; }
@@ -118,12 +118,12 @@ namespace Goni.DaggerPerfectCancel
             var player = Player.m_localPlayer;
             if (_swordEnabled != null && _swordEnabled.Value && IsSword(player == null ? null : player.GetCurrentWeapon()))
             {
-                // A faulted sword skill stays disabled; never substitute the old
-                // multi-primary macro after a failed skill startup.
+                // A faulted sword input feature stays disabled; do not silently
+                // substitute a different input sequence after a fault.
                 if (_swordReady)
                 {
-                    try { TryBeginSwordSkill(player, Time.time); }
-                    catch (Exception ex) { DisableSwordSkill(ex); }
+                    try { TryBeginSwordInput(player, Time.realtimeSinceStartup); }
+                    catch (Exception ex) { DisableSwordInput(ex); }
                 }
                 return;
             }
@@ -162,7 +162,7 @@ namespace Goni.DaggerPerfectCancel
             self._lastControlTime = Time.realtimeSinceStartup;
             try
             {
-                if (self.ApplySwordSkillControls(__instance, ref attack, ref attackHold, ref secondaryAttack,
+                if (self.ApplySwordInputControls(__instance, ref attack, ref attackHold, ref secondaryAttack,
                     ref secondaryAttackHold, ref block, ref blockHold, jump, dodge)) return;
                 if (!self._sequence.Running) return;
                 if (!self._enabled.Value || !self.CanContinue(__instance) || jump || dodge)
@@ -178,7 +178,7 @@ namespace Goni.DaggerPerfectCancel
             }
             catch (Exception ex)
             {
-                self.DisableSwordSkill(ex);
+                self.DisableSwordInput(ex);
                 self._sequence.Cancel(Time.realtimeSinceStartup, "control observation failed: " + ex.Message);
                 attack = attackHold = block = blockHold = secondaryAttack = secondaryAttackHold = false;
             }
@@ -242,8 +242,8 @@ namespace Goni.DaggerPerfectCancel
         }
         private void ReleaseFeatures(string reason)
         {
-            try { if (_skill.Running) CancelSwordSkill(reason); }
-            catch (Exception ex) { DisableSwordSkill(ex); }
+            try { if (_swordInput.Running) CancelSwordInput(reason); }
+            catch (Exception ex) { DisableSwordInput(ex); }
             if (_ready && _sequence.Running) CancelAndRelease(reason);
         }
         private void OnApplicationFocus(bool focused) { if (!focused) ReleaseFeatures("window lost focus"); }
@@ -253,7 +253,6 @@ namespace Goni.DaggerPerfectCancel
             ReleaseFeatures("plugin unloaded");
             _harmony?.UnpatchSelf();
             _swordHarmony?.UnpatchSelf();
-            _tempoHarmony?.UnpatchSelf();
             _ready = false;
             if (_instance == this) _instance = null;
         }

@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using BepInEx.Configuration;
 using HarmonyLib;
 using UnityEngine;
@@ -11,68 +10,56 @@ namespace Goni.DaggerPerfectCancel
     public sealed partial class DaggerPerfectCancelPlugin
     {
         private Harmony _swordHarmony;
-        private bool _swordReady, _swordFaulted, _startingSkillAttack, _startingSkillSlash, _allowSkillChain;
+        private bool _swordReady, _swordFaulted, _insideSwordConsumer;
         private ConfigEntry<bool> _swordEnabled;
-        private ConfigEntry<float> _swordTimeout, _blockPoseSeconds;
-        private readonly SwordSkillSequence _skill = new SwordSkillSequence();
-        private FieldInfo _currentAttack, _animatorField, _animEventField, _queuedPrimary, _queuedSecondary;
-        private readonly List<FieldInfo> _secondaryProfileFields = new List<FieldInfo>();
-        private Player _skillOwner;
-        private ItemDrop.ItemData _skillWeapon;
-        private Attack _skillAttack, _preparedAttack;
-        private Animator _skillAnimator;
-        private CharacterAnimEvent _skillAnimEvent;
-        private string[] _slashTriggers;
-        private int _skillNumber;
-        private readonly List<AnimatorClipInfo> _blockClips = new List<AnimatorClipInfo>(8);
-        private sealed class SkillAttackStamp { internal bool Consumed, Cancelled; }
-        // Weak keys retain deduplication after completion/cancellation without
-        // retaining attacks/players over a long play session.
-        private readonly ConditionalWeakTable<Attack, SkillAttackStamp> _skillAttacks = new ConditionalWeakTable<Attack, SkillAttackStamp>();
+        private ConfigEntry<float> _dualTimeout;
+        private readonly SwordInputSequence _swordInput = new SwordInputSequence();
+        private FieldInfo _currentAttack, _currentSecondary, _secondaryInput, _secondaryHoldInput;
+        private FieldInfo _queuedPrimary, _queuedSecondary, _animatorField;
+        private Player _swordOwner;
+        private ItemDrop.ItemData _swordWeapon;
+        private Attack _postBlockAttack;
+        private Animator _swordAnimator;
+        private int _swordNumber, _postBlockMelee, _dualPrimaryMelee, _dualPrimaryStarts, _dualSecondaryStarts;
+        private float _swordBeganAt, _dualBeganAt, _dualStaminaSpent;
+        private bool _reported;
+        private readonly List<AnimatorClipInfo> _swordClips = new List<AnimatorClipInfo>(8);
 
-        private void TrySetupSwordSkill()
+        private void TrySetupSwordInput()
         {
             try
             {
-                _swordEnabled = Config.Bind("SwordSkill", "Enabled", true,
-                    "Mouse5 with a sword: one primary -> visible block -> three sword slashes using secondary damage. Replaces the old dual-input exploit.");
-                _swordTimeout = Config.Bind("SwordSkill", "StageTimeoutSeconds", 8f, "Abort watchdog per stage; not attack timing.");
-                _blockPoseSeconds = Config.Bind("SwordSkill", "VisibleBlockSeconds", .18f, "Minimum observed block animation before the triple slash.");
+                _swordEnabled = Config.Bind("SwordInput", "Enabled", true,
+                    "Mouse5: primary -> block -> ONE primary click -> hold primary+secondary together. Native inputs only.");
+                _dualTimeout = Config.Bind("SwordInput", "DualHoldTimeoutSeconds", 8f,
+                    "Abort watchdog only. Stop after three observed secondary-profile melee events; never synthesize hits.");
                 _currentAttack = RequiredField(typeof(Humanoid), "m_currentAttack", typeof(Attack));
-                _animatorField = RequiredField(typeof(Character), "m_animator", typeof(Animator));
-                _animEventField = RequiredField(typeof(Character), "m_animEvent", typeof(CharacterAnimEvent));
+                _currentSecondary = RequiredField(typeof(Humanoid), "m_currentAttackIsSecondary", typeof(bool));
+                _secondaryInput = RequiredField(typeof(Character), "m_secondaryAttack", typeof(bool));
+                _secondaryHoldInput = RequiredField(typeof(Character), "m_secondaryAttackHold", typeof(bool));
                 _queuedPrimary = RequiredField(typeof(Player), "m_queuedAttackTimer", typeof(float));
                 _queuedSecondary = RequiredField(typeof(Player), "m_queuedSecondAttackTimer", typeof(float));
-                // Optional modifiers vary across Valheim releases. Copy only
-                // fields present in the running game, without static IL links
-                // to newer health-based attack modifiers.
-                foreach (var name in new[] { "m_damageMultiplierPerMissingHP", "m_damageMultiplierByTotalHealthMissing",
-                    "m_forceMultiplier", "m_staggerMultiplier", "m_lowerDamagePerHit" })
+                _animatorField = RequiredField(typeof(Character), "m_animator", typeof(Animator));
+                _swordHarmony = new Harmony(PluginGuid + ".swordinput");
+                PatchSword(typeof(Player), "PlayerAttackInput", new[] { typeof(float) }, nameof(SwordConsumerPrefix), nameof(SwordConsumerPostfix), nameof(SwordConsumerFinalizer));
+                PatchSword(typeof(Humanoid), "StartAttack", new[] { typeof(Character), typeof(bool) }, null, nameof(SwordAttackAccepted));
+                PatchSword(typeof(Humanoid), "UpdateBlock", new[] { typeof(float) }, null, nameof(SwordBlockProcessed));
+                PatchSword(typeof(Attack), "DoMeleeAttack", Type.EmptyTypes, nameof(SwordMeleeBefore), nameof(SwordMeleeAfter));
+                PatchSword(typeof(Player), "UseStamina", new[] { typeof(float) }, nameof(SwordStaminaBefore), nameof(SwordStaminaAfter));
+                _swordInput.Transition = (stage, reason) =>
                 {
-                    var field = AccessTools.Field(typeof(Attack), name);
-                    if (field != null && (field.FieldType == typeof(float) || field.FieldType == typeof(bool)))
-                        _secondaryProfileFields.Add(field);
-                }
-                _swordHarmony = new Harmony(PluginGuid + ".swordskill");
-                PatchSkill(typeof(Player), "PlayerAttackInput", nameof(SkillAttackInputPrefix), null);
-                PatchSkill(typeof(Humanoid), "StartAttack", nameof(SkillStartGate), null);
-                PatchSkill(typeof(Attack), "Start", nameof(SkillPrepareAttack), null);
-                PatchSkill(typeof(Player), "HaveQueuedChain", nameof(SkillChainGate), null);
-                PatchSkill(typeof(Attack), "DoMeleeAttack", nameof(SkillMeleePrefix), nameof(SkillMeleePostfix));
-                _skill.Transition = (stage, reason) =>
-                {
-                    if (_verbose.Value || stage == SwordSkillSequence.Stage.WaitRelease)
-                        Logger.LogInfo("[SwordSkill #" + _skillNumber + "] " + stage + ": " + reason);
+                    if (stage == SwordInputSequence.Stage.DualHold) _dualBeganAt = Time.realtimeSinceStartup;
+                    if (_verbose.Value || stage == SwordInputSequence.Stage.DualHold || stage == SwordInputSequence.Stage.Releasing)
+                        Logger.LogInfo("[SwordInput #" + _swordNumber + "] " + stage + " @" + Time.realtimeSinceStartup.ToString("F3") + ": " + reason);
                 };
-                SetupSwordTempo();
                 _swordReady = true;
-                Logger.LogInfo("[SwordSkill] Ready: Mouse5 = primary -> visible block -> three secondary-damage sword slashes. Auto guard removed.");
+                Logger.LogInfo("[SwordInput] Ready: primary -> block -> ONE primary accepted -> immediate dual input. Damage, stamina, animation speed and chain rules are native.");
             }
             catch (Exception ex)
             {
                 _swordHarmony?.UnpatchSelf();
                 _swordReady = false;
-                Logger.LogError("[SwordSkill] Disabled; legacy block cancel remains available: " + ex.Message);
+                Logger.LogError("[SwordInput] Disabled: " + ex.Message);
             }
         }
         private static FieldInfo RequiredField(Type type, string name, Type expected)
@@ -81,285 +68,263 @@ namespace Goni.DaggerPerfectCancel
             if (field == null || field.FieldType != expected) throw new MissingFieldException(type.Name, name);
             return field;
         }
-        private void PatchSkill(Type type, string name, string prefix, string postfix)
+        private void PatchSword(Type type, string name, Type[] args, string prefix, string postfix, string finalizer = null)
         {
-            var method = AccessTools.Method(type, name);
+            var method = AccessTools.Method(type, name, args);
             if (method == null) throw new MissingMethodException(type.Name, name);
             _swordHarmony.Patch(method,
                 prefix: prefix == null ? null : new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), prefix) { priority = Priority.Last },
-                postfix: postfix == null ? null : new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), postfix));
-        }
-        private bool TryBeginSwordSkill(Player player, double now)
-        {
-            var weapon = player == null ? null : player.GetCurrentWeapon();
-            if (!_swordReady || !_swordEnabled.Value || !IsSword(weapon)) return false;
-            // Returning true means this press belongs to the sword feature, even
-            // if it is rejected. Never silently run the obsolete sword macro.
-            if (_skill.Current != SwordSkillSequence.Stage.Idle || !CanUsePlayer(player)
-                || player.InAttack() || player.IsBlocking()) return true;
-            if (!weapon.HaveSecondaryAttack() || weapon.m_shared.m_attack == null
-                || weapon.m_shared.m_secondaryAttack == null
-                || !IsMelee(weapon.m_shared.m_attack) || !IsMelee(weapon.m_shared.m_secondaryAttack))
-            {
-                Logger.LogWarning("[SwordSkill] Unsupported sword attack profile."); return true;
-            }
-            var animator = (Animator)_animatorField.GetValue(player);
-            var animEvent = (CharacterAnimEvent)_animEventField.GetValue(player);
-            var primary = weapon.m_shared.m_attack;
-            if (animator == null || animEvent == null || primary.m_attackChainLevels < 3)
-            {
-                Logger.LogWarning("[SwordSkill] This sword needs a three-stage primary animation."); return true;
-            }
-            var triggers = new[] { primary.m_attackAnimation + "0", primary.m_attackAnimation + "1", primary.m_attackAnimation + "2" };
-            var parameters = animator.parameters;
-            foreach (var trigger in triggers)
-            {
-                if (!Array.Exists(parameters, p => p.type == AnimatorControllerParameterType.Trigger && p.name == trigger))
-                { Logger.LogWarning("[SwordSkill] Missing animation trigger: " + trigger); return true; }
-            }
-            _skillOwner = player; _skillWeapon = weapon; _skillAnimator = animator; _skillAnimEvent = animEvent;
-            _skillAttack = _preparedAttack = null; _slashTriggers = triggers;
-            _skill.Timeout = Mathf.Clamp(_swordTimeout.Value, 1f, 30f);
-            _skill.BlockPoseSeconds = _tempoReady && _tempoEnabled.Value
-                ? Mathf.Clamp(_tempoBlockSeconds.Value, .06f, .30f)
-                : Mathf.Clamp(_blockPoseSeconds.Value, .10f, 1f);
-            ++_skillNumber;
-            _lastControlTime = Time.realtimeSinceStartup;
-            ClearSkillQueues(player);
-            SetCombatNeutral(player);
-            BeginSwordReport();
-            _skill.Begin(now);
-            Logger.LogInfo("[SwordSkill #" + _skillNumber + "] weapon=" + weapon.m_shared.m_name
-                + "; secondaryDamageMultiplier=" + weapon.m_shared.m_secondaryAttack.m_damageMultiplier
-                + "; slashAnimations=" + string.Join(",", triggers) + "; slashStamina=0"
-                + "; tempo=" + (_tempoReady && _tempoEnabled.Value ? "on" : "off")
-                + "; slashSpeed=" + (_tempoReady && _tempoEnabled.Value ? Mathf.Clamp(_slashSpeed.Value, 1f, 3.5f) : 1f)
-                + "; recoverySpeed=" + (_tempoReady && _tempoEnabled.Value ? Mathf.Clamp(_recoverySpeed.Value, 1f, 6f) : 1f));
-            return true;
+                postfix: postfix == null ? null : new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), postfix) { priority = Priority.Last },
+                finalizer: finalizer == null ? null : new HarmonyMethod(typeof(DaggerPerfectCancelPlugin), finalizer));
         }
         private static bool IsSword(ItemDrop.ItemData weapon) => weapon?.m_shared != null && weapon.m_shared.m_skillType == Skills.SkillType.Swords;
         private static bool IsMelee(Attack attack) => attack != null &&
             (attack.m_attackType == Attack.AttackType.Horizontal || attack.m_attackType == Attack.AttackType.Vertical);
-        private bool SkillOwnerValid() => _enabled.Value && _swordEnabled.Value && CanUsePlayer(_skillOwner)
-            && ReferenceEquals(_skillOwner.GetCurrentWeapon(), _skillWeapon);
-
-        private void TickSwordSkill(bool triggerHeld)
+        private bool SwordOwnerValid() => _enabled.Value && _swordEnabled.Value && CanUsePlayer(_swordOwner)
+            && ReferenceEquals(_swordOwner.GetCurrentWeapon(), _swordWeapon);
+        private bool TryBeginSwordInput(Player player, double now)
         {
-            if (!_swordReady) return;
-            double now = Time.time;
-            _skill.Rearm(triggerHeld, now);
-            if (!_skill.Running) return;
-            if (!SkillOwnerValid()) { CancelSwordSkill("player/UI/focus/weapon interruption"); return; }
+            var weapon = player == null ? null : player.GetCurrentWeapon();
+            if (!_swordReady || !_swordEnabled.Value || !IsSword(weapon)) return false;
+            if (_swordInput.Current != SwordInputSequence.Stage.Idle || !CanUsePlayer(player)
+                || player.InAttack() || player.IsBlocking() || ReadBool(_engineBlocking, player)) return true;
+            if (!weapon.HaveSecondaryAttack() || !IsMelee(weapon.m_shared.m_attack) || !IsMelee(weapon.m_shared.m_secondaryAttack))
+            { Logger.LogWarning("[SwordInput] Unsupported melee sword."); return true; }
+            _swordOwner = player; _swordWeapon = weapon;
+            _swordAnimator = (Animator)_animatorField.GetValue(player);
+            _postBlockAttack = null;
+            _postBlockMelee = _dualPrimaryMelee = _dualPrimaryStarts = _dualSecondaryStarts = 0;
+            _dualStaminaSpent = 0; _dualBeganAt = 0;
+            _reported = false; _swordBeganAt = Time.realtimeSinceStartup;
+            _swordInput.StartTimeout = Mathf.Clamp(_startTimeout.Value, .1f, 30f);
+            _swordInput.EndTimeout = Mathf.Clamp(_endTimeout.Value, .1f, 30f);
+            _swordInput.BlockTimeout = Mathf.Clamp(_blockTimeout.Value, .1f, 30f);
+            _swordInput.DualTimeout = Mathf.Clamp(_dualTimeout.Value, .5f, 30f);
+            _lastControlTime = Time.realtimeSinceStartup;
+            ++_swordNumber;
+            ClearSwordQueues();
+            WriteSwordControls(default);
+            _swordInput.Begin(now);
+            Logger.LogInfo("[SwordInput #" + _swordNumber + "] weapon=" + weapon.m_shared.m_name
+                + "; nativeSecondaryMultiplier=" + weapon.m_shared.m_secondaryAttack.m_damageMultiplier
+                + "; nativeSecondaryStamina=" + weapon.m_shared.m_secondaryAttack.m_attackStamina
+                + "; inputOnly=true; postBlockWait=StartAttackAccepted (NOT melee event)");
+            return true;
+        }
+        private void TickSwordInput(bool triggerHeld)
+        {
+            _swordInput.Rearm(triggerHeld, Time.realtimeSinceStartup);
+            if (!_swordInput.Running) return;
+            if (!SwordOwnerValid()) { CancelSwordInput("player/UI/focus/weapon interruption"); return; }
             if (Time.realtimeSinceStartup - _lastControlTime > 1f)
-            { CancelSwordSkill("control updates stopped"); return; }
-            ApplySwordTempo();
-            bool inAttack = _skillOwner.InAttack();
-            bool currentMatches = ReferenceEquals(_currentAttack.GetValue(_skillOwner), _skillAttack);
-            if (_skillAttack != null && !currentMatches && inAttack)
-            { CancelSwordSkill("another attack replaced this skill"); return; }
-            bool canChain = currentMatches && _skill.EventSeen && _skillAnimEvent.CanChain();
-            bool blocking = _skillOwner.IsBlocking() || ReadBool(_engineBlocking, _skillOwner);
-            bool visibleBlock = _skill.WantsBlock && ReadBool(_engineBlocking, _skillOwner)
-                && _skillAnimator.GetBool("blocking") && HasBlockClip(_skillAnimator);
-            _skill.Tick(now, inAttack, canChain, blocking, visibleBlock, Time.frameCount);
-            if (!_skill.Running)
-            {
-                if (_skill.Result != null && _skill.Result.Contains("watchdog at Block"))
-                    LogBlockClips();
-                ReleaseSwordSkill(); return;
-            }
-            if (!_skill.WantsStart) return;
-            _startingSkillAttack = true;
-            _startingSkillSlash = _skill.IsSlash;
-            _allowSkillChain = _startingSkillSlash && canChain;
-            _preparedAttack = null;
-            try
-            {
-                // Normal game attack startup creates a fresh Attack clone and
-                // plays its networked animation. Only that clone is configured.
-                bool accepted = _skillOwner.StartAttack(null, false);
-                if (!accepted) return;
-                var actual = (Attack)_currentAttack.GetValue(_skillOwner);
-                if (actual == null || !ReferenceEquals(actual, _preparedAttack))
-                { CancelSwordSkill("attack startup was replaced by another patch"); return; }
-                _skillAttack = actual;
-                _skillAttacks.Add(actual, new SkillAttackStamp());
-                if (_startingSkillSlash && _skill.SlashesStarted == 0) _firstSlashAt = Time.realtimeSinceStartup;
-                _skill.Accepted(now);
-                ApplySwordTempo();
-            }
-            catch (Exception ex) { DisableSwordSkill(ex); }
-            finally { _startingSkillAttack = _startingSkillSlash = _allowSkillChain = false; }
+            { CancelSwordInput("control updates stopped"); return; }
+            _swordInput.Tick(Time.realtimeSinceStartup, _swordOwner.InAttack());
+            if (_swordInput.Current == SwordInputSequence.Stage.Releasing) ReleaseSwordInput();
         }
-        private void LogBlockClips()
-        {
-            if (_skillAnimator == null) return;
-            var names = new List<string>();
-            for (int layer = 0; layer < _skillAnimator.layerCount; ++layer)
-            {
-                _blockClips.Clear();
-                _skillAnimator.GetCurrentAnimatorClipInfo(layer, _blockClips);
-                foreach (var clip in _blockClips)
-                    if (clip.clip != null) names.Add(layer + ":" + clip.clip.name + "@" + clip.weight.ToString("F2"));
-            }
-            Logger.LogWarning("[SwordSkill] Block motion not acknowledged. Current clips: " + string.Join(", ", names));
-        }
-        private bool HasBlockClip(Animator animator)
-        {
-            for (int layer = 0; layer < animator.layerCount; ++layer)
-            {
-                if (layer != 0 && animator.GetLayerWeight(layer) < .01f) continue;
-                _blockClips.Clear();
-                animator.GetCurrentAnimatorClipInfo(layer, _blockClips);
-                foreach (var clip in _blockClips)
-                    if (clip.weight > .05f && clip.clip != null
-                        && clip.clip.name.IndexOf("block", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            }
-            return false;
-        }
-        private bool ApplySwordSkillControls(Player player, ref bool attack, ref bool attackHold,
+        private bool ApplySwordInputControls(Player player, ref bool attack, ref bool attackHold,
             ref bool secondary, ref bool secondaryHold, ref bool block, ref bool blockHold, bool jump, bool dodge)
         {
-            if (!_skill.Running || player != _skillOwner) return false;
-            if (jump || dodge || !SkillOwnerValid()) CancelSwordSkill("jump/dodge/input interruption");
-            attack = attackHold = secondary = secondaryHold = false;
-            block = blockHold = _skill.Running && _skill.WantsBlock;
+            if (!_swordInput.Running || player != _swordOwner) return false;
+            if (jump || dodge || !SwordOwnerValid()) CancelSwordInput("jump/dodge/input interruption");
+            else _swordInput.Tick(Time.realtimeSinceStartup, player.InAttack());
+            var c = _swordInput.Output();
+            attack = c.Attack; attackHold = c.AttackHold;
+            secondary = c.Secondary; secondaryHold = c.SecondaryHold;
+            block = blockHold = c.Block;
             return true;
         }
-        private static bool SkillAttackInputPrefix(Player __instance)
+        private static void SwordConsumerPrefix(Player __instance, out SwordInputSequence.Controls __state)
         {
+            __state = default;
             var self = _instance;
-            if (self == null || !self._swordReady || !self._skill.Running || __instance != self._skillOwner) return true;
-            try { self.ClearSkillQueues(__instance); }
-            catch (Exception ex) { self.DisableSwordSkill(ex); }
-            return false; // The skill owns attack startup; no parallel input queue.
-        }
-        private static bool SkillStartGate(Humanoid __instance, ref bool __result)
-        {
-            var self = _instance;
-            if (self == null || !self._skill.Running || __instance != self._skillOwner || self._startingSkillAttack) return true;
-            __result = false; return false;
-        }
-        private static bool SkillChainGate(Player __instance, ref bool __result)
-        {
-            var self = _instance;
-            if (self == null || !self._startingSkillAttack || __instance != self._skillOwner) return true;
-            __result = self._allowSkillChain; return false;
-        }
-        private static void SkillPrepareAttack(Attack __instance, Humanoid character, ItemDrop.ItemData weapon,
-            ref Attack previousAttack, ref float timeSinceLastAttack)
-        {
-            var self = _instance;
-            if (self == null || !self._startingSkillAttack || character != self._skillOwner
-                || !ReferenceEquals(weapon, self._skillWeapon)) return;
-            // Shared item data/prefabs are never edited. Attack.Start sees the
-            // fresh clone already allocated by vanilla Humanoid.StartAttack.
-            self._preparedAttack = __instance;
-            previousAttack = null; timeSinceLastAttack = 0f;
-            if (!self._startingSkillSlash) return;
-            var secondary = weapon.m_shared.m_secondaryAttack;
-            __instance.m_attackAnimation = self._slashTriggers[self._skill.SlashesStarted];
-            __instance.m_attackChainLevels = 0; // Explicit 0/1/2 animation triggers; no vanilla final-hit 2x bonus.
-            __instance.m_attackRandomAnimations = 1;
-            __instance.m_damageMultiplier = secondary.m_damageMultiplier;
-            foreach (var field in self._secondaryProfileFields)
-                field.SetValue(__instance, field.GetValue(secondary));
-            __instance.m_attackStamina = 0f;
-        }
-        private static bool SkillMeleePrefix(Attack __instance)
-        {
-            var self = _instance;
-            if (self == null || !self._skillAttacks.TryGetValue(__instance, out var stamp)) return true;
-            if (stamp.Consumed || stamp.Cancelled || !self._skill.Running
-                || !ReferenceEquals(__instance, self._skillAttack)) return false;
+            if (self == null || !self._swordReady || !self._swordInput.Running || __instance != self._swordOwner) return;
             try
             {
-                if (!self.SkillOwnerValid()) { self.CancelSwordSkill("interrupted before melee event"); return false; }
+                if (!self.SwordOwnerValid()) { self.CancelSwordInput("input consumer interruption"); return; }
+                self._swordInput.Tick(Time.realtimeSinceStartup, __instance.InAttack());
+                if (self._swordInput.Current == SwordInputSequence.Stage.Releasing) { self.ReleaseSwordInput(); return; }
+                // Refresh at the actual physics consumer too: multiple physics
+                // steps per rendered frame must not repeat a stale single click.
+                self.WriteSwordControls(self._swordInput.Output());
+                __state = new SwordInputSequence.Controls { Override = true,
+                    Attack = ReadBool(self._attackInput, __instance), AttackHold = ReadBool(self._attackHoldInput, __instance),
+                    Secondary = ReadBool(self._secondaryInput, __instance), SecondaryHold = ReadBool(self._secondaryHoldInput, __instance),
+                    Block = ReadBool(self._blockInput, __instance) };
+                self._insideSwordConsumer = true;
             }
-            catch (Exception ex) { self.DisableSwordSkill(ex); return false; }
-            // Several targets in a swing are processed by vanilla in ONE call.
-            // A duplicate animation event must not deal a fourth hit.
-            stamp.Consumed = true;
-            return true;
+            catch (Exception ex) { self.DisableSwordInput(ex); }
+            // ALWAYS let vanilla PlayerAttackInput run; no forced StartAttack.
         }
-        private static void SkillMeleePostfix(Attack __instance, bool __runOriginal)
+        private static void SwordConsumerPostfix(Player __instance, SwordInputSequence.Controls __state, bool __runOriginal)
         {
             var self = _instance;
-            if (!__runOriginal || self == null || !self._skill.Running || !ReferenceEquals(__instance, self._skillAttack)) return;
-            if (!self._skill.MeleeEvent()) return;
-            self.ObserveSwordMelee(__instance);
-            if (self._verbose.Value)
-                self.Logger.LogInfo("[SwordSkill #" + self._skillNumber + "] melee: opening=" + self._skill.OpeningEvents
-                    + "; slashes=" + self._skill.SlashesCompleted + "/3; damageMultiplier=" + __instance.m_damageMultiplier
-                    + "; attackStamina=" + __instance.m_attackStamina);
+            if (self == null || !__state.Override || __instance != self._swordOwner) return;
+            self._insideSwordConsumer = false;
+            try
+            {
+                if (!__runOriginal) { self.CancelSwordInput("another patch skipped the native input consumer"); return; }
+                self._swordInput.ConsumerCompleted(__state, Time.realtimeSinceStartup);
+                // Publish both buttons together immediately after the ONE
+                // accepted post-block click's consumer returns. The NEXT native
+                // consumer receives both, without waiting for a hit or Update.
+                self.WriteSwordControls(self._swordInput.Output());
+            }
+            catch (Exception ex) { self.DisableSwordInput(ex); }
         }
-        private void ClearSkillQueues(Player player)
+        private static Exception SwordConsumerFinalizer(Player __instance, Exception __exception)
         {
-            _queuedPrimary.SetValue(player, 0f); _queuedSecondary.SetValue(player, 0f);
+            var self = _instance;
+            if (self != null && __instance == self._swordOwner)
+            {
+                self._insideSwordConsumer = false;
+                if (__exception != null) self.DisableSwordInput(__exception);
+            }
+            return __exception; // Preserve unrelated game exceptions.
         }
-        private void SetCombatNeutral(Player player)
+        private static void SwordAttackAccepted(Humanoid __instance, bool secondaryAttack, bool __result, bool __runOriginal)
         {
-            if (player == null || player != Player.m_localPlayer) return;
+            var self = _instance;
+            if (self == null || !self._insideSwordConsumer || __instance != self._swordOwner || !__result || !__runOriginal) return;
+            try
+            {
+                var before = self._swordInput.Current;
+                if (before == SwordInputSequence.Stage.PostBlockPress && !secondaryAttack)
+                    self._postBlockAttack = (Attack)self._currentAttack.GetValue(__instance);
+                if (before == SwordInputSequence.Stage.DualHold)
+                { if (secondaryAttack) ++self._dualSecondaryStarts; else ++self._dualPrimaryStarts; }
+                self._swordInput.AttackAccepted(secondaryAttack, Time.realtimeSinceStartup);
+            }
+            catch (Exception ex) { self.DisableSwordInput(ex); }
+        }
+        private static void SwordBlockProcessed(Humanoid __instance, bool __runOriginal)
+        {
+            var self = _instance;
+            if (self == null || !self._swordReady || !self._swordInput.Running || __instance != self._swordOwner || !__runOriginal) return;
+            try { self._swordInput.BlockProcessed(ReadBool(self._blockInput, __instance), __instance.IsBlocking(),
+                ReadBool(self._engineBlocking, __instance), Time.realtimeSinceStartup); }
+            catch (Exception ex) { self.DisableSwordInput(ex); }
+        }
+        private struct SwordMeleeObservation { internal bool Active, Secondary, PostBlock; internal int Number; }
+        private static void SwordMeleeBefore(Attack __instance, out SwordMeleeObservation __state)
+        {
+            __state = default;
+            var self = _instance;
+            if (self == null || !self._swordReady || !self._swordInput.Running || self._swordOwner == null) return;
+            try
+            {
+                if (!ReferenceEquals(self._currentAttack.GetValue(self._swordOwner), __instance)) return;
+                __state = new SwordMeleeObservation { Active = true, Number = self._swordNumber,
+                    Secondary = ReadBool(self._currentSecondary, self._swordOwner), PostBlock = ReferenceEquals(self._postBlockAttack, __instance) };
+            }
+            catch (Exception ex) { self.DisableSwordInput(ex); }
+            // No event suppression, deduplication, damage writes or synthetic hit.
+        }
+        private static void SwordMeleeAfter(Attack __instance, SwordMeleeObservation __state, bool __runOriginal)
+        {
+            var self = _instance;
+            if (!__runOriginal || !__state.Active || self == null || !self._swordInput.Running || __state.Number != self._swordNumber) return;
+            try
+            {
+                if (!self.SwordOwnerValid()) { self.CancelSwordInput("interrupted during melee"); return; }
+                if (__state.PostBlock && !__state.Secondary) ++self._postBlockMelee;
+                else if (self._swordInput.Current == SwordInputSequence.Stage.DualHold && !__state.Secondary) ++self._dualPrimaryMelee;
+                bool counted = __state.Secondary && self._swordInput.SecondaryMelee(Time.realtimeSinceStartup);
+                if (counted || self._verbose.Value)
+                    self.Logger.LogInfo("[SwordInput #" + self._swordNumber + "] nativeMelee: secondary=" + __state.Secondary
+                        + "; secondaryEvents=" + self._swordInput.SecondaryEvents + "/3; multiplier=" + __instance.m_damageMultiplier
+                        + "; profileStamina=" + __instance.m_attackStamina + "; attackAnimation=" + __instance.m_attackAnimation
+                        + "; clips=" + self.DescribeSwordClips());
+                if (self._swordInput.Current == SwordInputSequence.Stage.Releasing) self.ReleaseSwordInput();
+            }
+            catch (Exception ex) { self.DisableSwordInput(ex); }
+        }
+        private string DescribeSwordClips()
+        {
+            if (_swordAnimator == null) return "unavailable";
+            var names = new List<string>();
+            for (int layer = 0; layer < _swordAnimator.layerCount; ++layer)
+            {
+                if (layer > 0 && _swordAnimator.GetLayerWeight(layer) < .01f) continue;
+                _swordClips.Clear(); _swordAnimator.GetCurrentAnimatorClipInfo(layer, _swordClips);
+                foreach (var c in _swordClips) if (c.weight > .05f && c.clip != null) names.Add(c.clip.name);
+            }
+            return string.Join(",", names);
+        }
+        private static void SwordStaminaBefore(Player __instance, out float __state)
+        {
+            var self = _instance;
+            __state = self != null && __instance == self._swordOwner && self._swordInput.Current == SwordInputSequence.Stage.DualHold
+                ? __instance.GetStamina() : float.NaN;
+        }
+        private static void SwordStaminaAfter(Player __instance, float __state)
+        {
+            var self = _instance;
+            if (!float.IsNaN(__state) && self != null && __instance == self._swordOwner)
+                self._dualStaminaSpent += Mathf.Max(0, __state - __instance.GetStamina());
+        }
+        private void WriteSwordControls(SwordInputSequence.Controls c)
+        {
+            if (_swordOwner == null || _swordOwner != Player.m_localPlayer) return;
             bool old = _releasing;
             try
             {
                 _releasing = true;
-                bool focused = Application.isFocused && TakesInput(player);
-                player.SetControls(focused ? _rawMove : Vector3.zero, false, false, false, false,
-                    false, false, false, false, focused && _rawRun, false, false);
+                bool focused = Application.isFocused && TakesInput(_swordOwner);
+                _swordOwner.SetControls(focused ? _rawMove : Vector3.zero, c.Attack, c.AttackHold, c.Secondary, c.SecondaryHold,
+                    c.Block, c.Block, false, false, focused && _rawRun, false, false);
             }
             finally { _releasing = old; }
         }
-        private void DisableSwordSkill(Exception error)
+        private void ClearSwordQueues()
+        {
+            // Only INPUT queues, at acquisition/release. Never alter attack,
+            // stamina, animation, chain, blocking or damage state fields.
+            if (_swordOwner == null || _swordOwner != Player.m_localPlayer) return;
+            _queuedPrimary.SetValue(_swordOwner, 0f); _queuedSecondary.SetValue(_swordOwner, 0f);
+        }
+        private void CancelSwordInput(string reason)
+        {
+            if (!_swordInput.Running) return;
+            _swordInput.Cancel(Time.realtimeSinceStartup, reason);
+            ReleaseSwordInput();
+        }
+        private void DisableSwordInput(Exception ex)
         {
             if (_swordFaulted) return;
-            // Latch BEFORE cleanup/logging; failed cleanup cannot re-enter the
-            // same broken path on every subsequent Update/SetControls call.
-            _swordFaulted = true;
-            _swordReady = false;
-            try { CancelSwordSkill("runtime fault; disabled until restart"); }
-            catch { ClearSwordReferences(); }
-            Logger.LogError("[SwordSkill] Disabled for this session after " + error.GetType().Name
-                + ": " + error.Message + ". No automatic retry. " + error.StackTrace);
+            _swordFaulted = true; _swordReady = false; _insideSwordConsumer = false;
+            try { CancelSwordInput("runtime fault; disabled until restart"); }
+            catch { }
+            finally { ClearSwordInputReferences(); }
+            Logger.LogError("[SwordInput] Disabled once for this session: " + ex.GetType().Name + ": " + ex.Message + ". " + ex.StackTrace);
         }
-        private void CancelSwordSkill(string reason)
+        private void ReleaseSwordInput()
         {
-            if (!_skill.Running) return;
-            if (_skillAttack != null && _skillAttacks.TryGetValue(_skillAttack, out var stamp)) stamp.Cancelled = true;
-            // Stop state-machine ownership first, even if an engine API below is unavailable.
-            _skill.Cancel(Time.time, reason);
-            try
-            {
-                if (_skillAttack != null && _skillOwner != null
-                    && ReferenceEquals(_currentAttack.GetValue(_skillOwner), _skillAttack)) _skillAttack.Abort();
-            }
-            finally { ReleaseSwordSkill(); }
-        }
-        private void ReleaseSwordSkill()
-        {
-            try
-            {
-                if (_skillOwner != null && _skillOwner == Player.m_localPlayer)
-                {
-                    try { ClearSkillQueues(_skillOwner); }
-                    finally { SetCombatNeutral(_skillOwner); }
-                }
-            }
+            try { try { ClearSwordQueues(); } finally { WriteSwordControls(default); } }
             finally
             {
-                try { ReportSwordSkill(); }
-                finally
+                _swordInput.Neutralized(Time.realtimeSinceStartup);
+                try
                 {
-                    try { RestoreSwordTempo(); }
-                    finally { ClearSwordReferences(); }
+                    if (!_reported)
+                    {
+                        _reported = true;
+                        Logger.LogInfo("[SwordInput #" + _swordNumber + "] result=" + _swordInput.Result
+                            + "; openingStarts=" + _swordInput.OpeningStarts + "; postBlockPrimaryStarts=" + _swordInput.PostBlockStarts
+                            + "; postBlockPrimaryMelee=" + _postBlockMelee + "; primaryMeleeDuringDual=" + _dualPrimaryMelee
+                            + "; dualPrimaryStarts=" + _dualPrimaryStarts + "; dualSecondaryStarts=" + _dualSecondaryStarts
+                            + "; secondaryEvents=" + _swordInput.SecondaryEvents + "/3; staminaSpentDuringDual=" + _dualStaminaSpent.ToString("F3")
+                            + "; duration=" + (Time.realtimeSinceStartup - _swordBeganAt).ToString("F3")
+                            + "; dualDuration=" + (_dualBeganAt > 0 ? Time.realtimeSinceStartup - _dualBeganAt : 0).ToString("F3")
+                            + ". Native observations, not a guarantee of the power-combo animation or enemy HP loss. Stamina includes other actions.");
+                    }
                 }
+                finally { ClearSwordInputReferences(); }
             }
         }
-        private void ClearSwordReferences()
+        private void ClearSwordInputReferences()
         {
-            _skillAttack = _preparedAttack = null;
-            _skillOwner = null; _skillWeapon = null; _skillAnimator = null; _skillAnimEvent = null;
-            _startingSkillAttack = _startingSkillSlash = _allowSkillChain = false;
+            _swordOwner = null; _swordWeapon = null; _postBlockAttack = null; _swordAnimator = null;
+            _insideSwordConsumer = false; _swordClips.Clear();
         }
     }
 }
